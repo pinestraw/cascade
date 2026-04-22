@@ -42,12 +42,13 @@ instructions:
 
 commands:
   create_worktree: "make agent-worktree-create agent={agent} slug={slug}"
-  init_mandate: "make mandate-init MANDATE_SLUG={slug}"
+  mandate_start: "make mandate-start MANDATE_SLUG={slug} MANDATE_TITLE={title_shell} MANDATE_CANONICAL_MANDATE={canonical_mandate_shell} MANDATE_ACTIVE_BRANCH={active_branch_shell}"
   preflight: "make mandate-preflight MANDATE_SLUG={slug}"
   done: "make mandate-done MANDATE_SLUG={slug}"
   status: "git status --short"
 
 branches:
+  active_branch: staging
   agent_branch_template: "agent/{agent}/{slug}"
 
 # ---------------------------------------------------------------------------

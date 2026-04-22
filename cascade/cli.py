@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import platform
 import json
 import shlex
@@ -80,6 +81,10 @@ from cascade.worktrees import find_worktree_path, slugify
 
 console = Console()
 app = typer.Typer(help="Cascade multi-agent mandate runner.")
+NO_INIT_MANDATE_MESSAGE = (
+    "Missing mandate start command config: set one of "
+    "commands.mandate_start, commands.start_mandate, or commands.init_mandate."
+)
 
 
 class AgentLifecycleState(str, Enum):
@@ -98,6 +103,36 @@ class LogKind(str, Enum):
     preflight = "preflight"
     prompt = "prompt"
     mandate = "mandate"
+
+
+class RepairKind(str, Enum):
+    auto = "auto"
+    missing_mandate_metadata = "missing-mandate-metadata"
+
+
+@dataclass(frozen=True)
+class RepairFinding:
+    kind: RepairKind
+    slug: str
+    title: str
+    worktree: Path
+    metadata_path: Path
+    canonical_mandate_path: Path
+    message: str
+    can_repair: bool
+    repair_command: str | None
+
+
+@dataclass(frozen=True)
+class RepairResult:
+    kind: RepairKind
+    success: bool
+    dry_run: bool
+    message: str
+    log_path: Path
+    stash_ref: str | None = None
+    stash_message: str | None = None
+    stash_pop_conflict: bool = False
 
 
 def print_error(message: str) -> None:
@@ -168,6 +203,96 @@ def build_prompt_copy_command(
     return f"{' '.join(shlex.quote(part) for part in command_parts)} | pbcopy"
 
 
+def resolve_mandate_start_template(project: ProjectConfig) -> str | None:
+    return (
+        project.commands.mandate_start
+        or project.commands.start_mandate
+        or project.commands.init_mandate
+    )
+
+
+def format_command_template(
+    template: str,
+    *,
+    project: ProjectConfig,
+    agent: str,
+    slug: str,
+    issue: int,
+    title: str,
+    active_branch: str = "",
+    canonical_mandate: Path | None = None,
+    branch: str = "",
+) -> str:
+    canonical = str(canonical_mandate) if canonical_mandate is not None else ""
+    return template.format(
+        agent=agent,
+        slug=slug,
+        branch=branch,
+        issue=issue,
+        project=project.name,
+        title=title,
+        title_shell=shlex.quote(title),
+        active_branch=active_branch,
+        active_branch_shell=shlex.quote(active_branch),
+        canonical_mandate=canonical,
+        canonical_mandate_shell=shlex.quote(canonical),
+    )
+
+
+def resolve_active_branch(
+    project: ProjectConfig,
+    *,
+    active_branch_override: str | None = None,
+) -> str | None:
+    if active_branch_override is not None and active_branch_override.strip():
+        return active_branch_override.strip()
+    for candidate in (
+        project.branches.active_branch,
+        project.branches.base,
+        project.default_active_branch,
+    ):
+        if candidate is not None and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def worktree_is_agent_branch(
+    project: ProjectConfig,
+    *,
+    worktree: Path,
+    agent: str,
+    slug: str,
+) -> bool:
+    current_branch = get_current_branch(worktree)
+    expected = build_branch_name(project, agent, slug)
+    return current_branch == expected or current_branch.startswith("agent/")
+
+
+def format_mandate_start_command(
+    project: ProjectConfig,
+    *,
+    agent: str,
+    slug: str,
+    issue: int,
+    title: str,
+    active_branch: str,
+    canonical_mandate: Path,
+) -> str | None:
+    template = resolve_mandate_start_template(project)
+    if template is None:
+        return None
+    return format_command_template(
+        template,
+        project=project,
+        agent=agent,
+        slug=slug,
+        issue=issue,
+        title=title,
+        active_branch=active_branch,
+        canonical_mandate=canonical_mandate,
+    )
+
+
 def mandate_metadata_dir(worktree: Path) -> Path:
     return worktree / ".github" / "mandates"
 
@@ -180,6 +305,356 @@ def repo_expects_mandate_metadata(worktree: Path) -> bool:
     return mandate_metadata_dir(worktree).exists()
 
 
+def detect_missing_mandate_metadata(
+    project_config: ProjectConfig,
+    agent_state: dict[str, object],
+    *,
+    active_branch_override: str | None = None,
+) -> RepairFinding | None:
+    agent_value = str(agent_state.get("agent", ""))
+    if not agent_value:
+        return None
+
+    worktree = Path(str(agent_state.get("worktree", "")))
+    if not worktree.exists():
+        return None
+    if not repo_expects_mandate_metadata(worktree):
+        return None
+
+    slug = str(agent_state.get("slug", "")).strip()
+    title = str(agent_state.get("title", "")).strip()
+    if not slug:
+        return None
+
+    active_branch = resolve_active_branch(
+        project_config,
+        active_branch_override=active_branch_override,
+    )
+
+    metadata = mandate_metadata_path(worktree, slug)
+    if metadata.exists():
+        return None
+
+    run_dir = get_agent_run_dir(project_config.name, agent_value)
+    canonical_mandate = run_dir / "mandate.md"
+    start_command = format_mandate_start_command(
+        project_config,
+        agent=agent_value,
+        slug=slug,
+        issue=int(agent_state.get("issue", 0) or 0),
+        title=title,
+        active_branch=active_branch or "",
+        canonical_mandate=canonical_mandate,
+    )
+
+    if start_command is not None and active_branch is None and worktree_is_agent_branch(
+        project_config,
+        worktree=worktree,
+        agent=agent_value,
+        slug=slug,
+    ):
+        return RepairFinding(
+            kind=RepairKind.missing_mandate_metadata,
+            slug=slug,
+            title=title,
+            worktree=worktree,
+            metadata_path=metadata,
+            canonical_mandate_path=canonical_mandate,
+            message=(
+                "Active branch is required for mandate_start. "
+                "Configure branches.active_branch or pass --active-branch."
+            ),
+            can_repair=False,
+            repair_command=None,
+        )
+
+    if start_command is None:
+        return RepairFinding(
+            kind=RepairKind.missing_mandate_metadata,
+            slug=slug,
+            title=title,
+            worktree=worktree,
+            metadata_path=metadata,
+            canonical_mandate_path=canonical_mandate,
+            message=(
+                "Required mandate metadata is missing: "
+                f"{metadata}. This repo expects .github/mandates/<slug>.json. "
+                f"{NO_INIT_MANDATE_MESSAGE}"
+            ),
+            can_repair=False,
+            repair_command=None,
+        )
+
+    if not title:
+        return RepairFinding(
+            kind=RepairKind.missing_mandate_metadata,
+            slug=slug,
+            title=title,
+            worktree=worktree,
+            metadata_path=metadata,
+            canonical_mandate_path=canonical_mandate,
+            message=f"Required mandate metadata is missing: {metadata}. Agent title is missing; cannot repair safely.",
+            can_repair=False,
+            repair_command=None,
+        )
+
+    if not canonical_mandate.exists():
+        return RepairFinding(
+            kind=RepairKind.missing_mandate_metadata,
+            slug=slug,
+            title=title,
+            worktree=worktree,
+            metadata_path=metadata,
+            canonical_mandate_path=canonical_mandate,
+            message=(
+                f"Required mandate metadata is missing: {metadata}. "
+                f"Canonical mandate file is missing: {canonical_mandate}."
+            ),
+            can_repair=False,
+            repair_command=None,
+        )
+
+    return RepairFinding(
+        kind=RepairKind.missing_mandate_metadata,
+        slug=slug,
+        title=title,
+        worktree=worktree,
+        metadata_path=metadata,
+        canonical_mandate_path=canonical_mandate,
+        message=f"Required mandate metadata is missing: {metadata}.",
+        can_repair=True,
+        repair_command=start_command,
+    )
+
+
+def run_git_stash_if_dirty(worktree: Path) -> tuple[str | None, str | None]:
+    status = run_command("git status --porcelain", cwd=worktree).stdout.strip()
+    if not status:
+        return None, None
+
+    stash_message = f"cascade-repair-before-mandate-start-{timestamp_utc()}"
+    run_command(f"git stash push -u -m {shlex.quote(stash_message)}", cwd=worktree)
+    stash_ref = run_command("git stash list --format=%gd -n 1", cwd=worktree).stdout.strip()
+    return stash_ref or None, stash_message
+
+
+def restore_git_stash(worktree: Path, stash_ref: str | None) -> tuple[bool, str | None]:
+    if stash_ref is None:
+        return True, None
+    try:
+        run_command(f"git stash pop {shlex.quote(stash_ref)}", cwd=worktree)
+    except CommandError as exc:
+        return False, str(exc)
+    return True, None
+
+
+def repair_missing_mandate_metadata(
+    project_config: ProjectConfig,
+    agent_state: dict[str, object],
+    *,
+    dry_run: bool = False,
+    allow_stash: bool = True,
+    active_branch_override: str | None = None,
+) -> RepairResult:
+    finding = detect_missing_mandate_metadata(
+        project_config,
+        agent_state,
+        active_branch_override=active_branch_override,
+    )
+    run_dir = get_agent_run_dir(project_config.name, str(agent_state["agent"]))
+    log_path = run_dir / "repair_missing_mandate_metadata.log"
+    log_lines = [
+        "# Repair Missing Mandate Metadata",
+        f"timestamp: {timestamp_utc()}",
+    ]
+
+    if finding is None:
+        worktree = Path(str(agent_state.get("worktree", "")))
+        slug = str(agent_state.get("slug", "")).strip()
+        if worktree.exists() and slug and repo_expects_mandate_metadata(worktree):
+            metadata = mandate_metadata_path(worktree, slug)
+            if metadata.exists():
+                message = f"Mandate metadata already exists at {metadata}. No repair is needed."
+                log_lines.append(message)
+                log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+                return RepairResult(
+                    kind=RepairKind.missing_mandate_metadata,
+                    success=True,
+                    dry_run=dry_run,
+                    message=message,
+                    log_path=log_path,
+                )
+
+        message = "No known safe repair detected for missing mandate metadata."
+        log_lines.append(message)
+        log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+        return RepairResult(
+            kind=RepairKind.missing_mandate_metadata,
+            success=False,
+            dry_run=dry_run,
+            message=message,
+            log_path=log_path,
+        )
+
+    log_lines.extend([
+        f"worktree: {finding.worktree}",
+        f"metadata_path: {finding.metadata_path}",
+        f"canonical_mandate_path: {finding.canonical_mandate_path}",
+    ])
+
+    if not finding.can_repair or finding.repair_command is None:
+        log_lines.append(finding.message)
+        log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+        return RepairResult(
+            kind=RepairKind.missing_mandate_metadata,
+            success=False,
+            dry_run=dry_run,
+            message=finding.message,
+            log_path=log_path,
+        )
+
+    log_lines.append(f"repair_command: {finding.repair_command}")
+    if dry_run:
+        log_lines.append("dry_run: true")
+        log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+        return RepairResult(
+            kind=RepairKind.missing_mandate_metadata,
+            success=True,
+            dry_run=True,
+            message="Dry run complete. Repair command is ready.",
+            log_path=log_path,
+        )
+
+    stash_ref: str | None = None
+    stash_message: str | None = None
+    if allow_stash:
+        stash_ref, stash_message = run_git_stash_if_dirty(finding.worktree)
+        if stash_ref is not None:
+            log_lines.append(f"stash_created: {stash_ref}")
+    else:
+        dirty = run_command("git status --porcelain", cwd=finding.worktree).stdout.strip()
+        if dirty:
+            message = (
+                "Worktree is dirty and automatic stashing is disabled for this operation. "
+                "Run `cascade repair <agent> --project <project>` to perform a safe stash-backed repair."
+            )
+            log_lines.append(message)
+            log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+            return RepairResult(
+                kind=RepairKind.missing_mandate_metadata,
+                success=False,
+                dry_run=False,
+                message=message,
+                log_path=log_path,
+            )
+
+    command_error: str | None = None
+    try:
+        run_command(finding.repair_command, cwd=finding.worktree)
+    except CommandError as exc:
+        command_error = str(exc)
+
+    if stash_ref is not None:
+        stash_ok, stash_error = restore_git_stash(finding.worktree, stash_ref)
+        if not stash_ok:
+            message = (
+                "Repair command ran, but restoring stashed changes failed. "
+                "Resolve conflicts in the worktree, then continue. The stash entry was not dropped."
+            )
+            log_lines.append(message)
+            log_lines.append(stash_error or "")
+            log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+            return RepairResult(
+                kind=RepairKind.missing_mandate_metadata,
+                success=False,
+                dry_run=False,
+                message=message,
+                log_path=log_path,
+                stash_ref=stash_ref,
+                stash_message=stash_message,
+                stash_pop_conflict=True,
+            )
+
+    if command_error is not None:
+        message = f"Repair command failed: {command_error}"
+        log_lines.append(message)
+        log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+        return RepairResult(
+            kind=RepairKind.missing_mandate_metadata,
+            success=False,
+            dry_run=False,
+            message=message,
+            log_path=log_path,
+            stash_ref=stash_ref,
+            stash_message=stash_message,
+        )
+
+    if not finding.metadata_path.exists():
+        message = (
+            "Repair command completed but mandate metadata is still missing: "
+            f"{finding.metadata_path}"
+        )
+        log_lines.append(message)
+        log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+        return RepairResult(
+            kind=RepairKind.missing_mandate_metadata,
+            success=False,
+            dry_run=False,
+            message=message,
+            log_path=log_path,
+            stash_ref=stash_ref,
+            stash_message=stash_message,
+        )
+
+    updated_state = dict(agent_state)
+    updated_state["last_repair_kind"] = RepairKind.missing_mandate_metadata.value
+    updated_state["last_repair_at"] = timestamp_utc()
+    updated_state["mandate_metadata_present"] = True
+    save_agent_state(project_config.name, str(agent_state["agent"]), updated_state)
+
+    message = "Repair completed successfully."
+    log_lines.append(message)
+    log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+    return RepairResult(
+        kind=RepairKind.missing_mandate_metadata,
+        success=True,
+        dry_run=False,
+        message=message,
+        log_path=log_path,
+        stash_ref=stash_ref,
+        stash_message=stash_message,
+    )
+
+
+def run_repair(
+    project_config: ProjectConfig,
+    agent_state: dict[str, object],
+    *,
+    kind: RepairKind,
+    dry_run: bool,
+    allow_stash: bool,
+    active_branch_override: str | None,
+) -> RepairResult:
+    if kind in {RepairKind.auto, RepairKind.missing_mandate_metadata}:
+        return repair_missing_mandate_metadata(
+            project_config,
+            agent_state,
+            dry_run=dry_run,
+            allow_stash=allow_stash,
+            active_branch_override=active_branch_override,
+        )
+
+    run_dir = get_agent_run_dir(project_config.name, str(agent_state["agent"]))
+    log_path = run_dir / "repair_missing_mandate_metadata.log"
+    return RepairResult(
+        kind=kind,
+        success=False,
+        dry_run=dry_run,
+        message="No known safe repair detected.",
+        log_path=log_path,
+    )
+
+
 def maybe_initialize_mandate_metadata(
     project: ProjectConfig,
     *,
@@ -187,35 +662,42 @@ def maybe_initialize_mandate_metadata(
     slug: str,
     agent: str,
     issue: int,
+    title: str,
+    active_branch_override: str | None = None,
 ) -> None:
-    if not repo_expects_mandate_metadata(worktree):
+    synthetic_state: dict[str, object] = {
+        "project": project.name,
+        "agent": agent,
+        "slug": slug,
+        "title": title,
+        "issue": issue,
+        "worktree": str(worktree),
+    }
+    finding = detect_missing_mandate_metadata(
+        project,
+        synthetic_state,
+        active_branch_override=active_branch_override,
+    )
+    if finding is None:
+        return
+    if not finding.can_repair:
+        print_warning(finding.message)
         return
 
-    metadata_path = mandate_metadata_path(worktree, slug)
-    if metadata_path.exists():
-        return
-
-    init_command = project.commands.init_mandate
-    if init_command is None:
-        print_warning(
-            "Target repo expects mandate metadata at "
-            f"{metadata_path}, but commands.init_mandate is not configured. "
-            "Preflight may fail until the repo's mandate init workflow is run."
-        )
-        return
-
-    try:
-        rendered_command = init_command.format(
-            agent=agent,
-            slug=slug,
-            issue=issue,
-            project=project.name,
-        )
-        run_command(rendered_command, cwd=worktree)
-    except CommandError as exc:
+    result = repair_missing_mandate_metadata(
+        project,
+        synthetic_state,
+        dry_run=False,
+        allow_stash=False,
+        active_branch_override=active_branch_override,
+    )
+    if not result.success:
         raise CommandError(
-            f"Failed to initialize mandate metadata with commands.init_mandate: {exc}"
-        ) from exc
+            cmd=finding.repair_command or "(missing mandate command)",
+            cwd=worktree,
+            exit_code=1,
+            output=result.message,
+        )
 
 
 def validate_mandate_metadata_before_preflight(
@@ -225,32 +707,28 @@ def validate_mandate_metadata_before_preflight(
     *,
     agent: str,
     issue: int,
+    title: str,
 ) -> None:
-    if not repo_expects_mandate_metadata(worktree):
+    synthetic_state: dict[str, object] = {
+        "project": project.name,
+        "agent": agent,
+        "slug": slug,
+        "title": title,
+        "issue": issue,
+        "worktree": str(worktree),
+    }
+    finding = detect_missing_mandate_metadata(project, synthetic_state)
+    if finding is None:
         return
 
-    metadata_path = mandate_metadata_path(worktree, slug)
-    if metadata_path.exists():
-        return
-
-    init_command = project.commands.init_mandate
-    if init_command is None:
+    if finding.can_repair:
         raise FileNotFoundError(
             "Required mandate metadata is missing: "
-            f"{metadata_path}. This repo expects .github/mandates/<slug>.json. "
-            "Configure commands.init_mandate or run the repo's mandate init workflow before preflight."
+            f"{finding.metadata_path}. Repair available: cascade repair {agent} --project {project.name}"
         )
 
-    suggested_command = init_command.format(
-        agent=agent,
-        slug=slug,
-        issue=issue,
-        project=project.name,
-    )
-
     raise FileNotFoundError(
-        "Required mandate metadata is missing: "
-        f"{metadata_path}. Run `cascade claim` again or initialize it manually with: {suggested_command}"
+        finding.message
     )
 
 
@@ -282,12 +760,14 @@ def claim(
 
     try:
         _, run_dir = ensure_project_state_dirs(project.name, agent)
-        create_worktree_command = project.commands.create_worktree.format(
+        create_worktree_command = format_command_template(
+            project.commands.create_worktree,
+            project=project,
             agent=agent,
             slug=slug,
             branch=branch,
             issue=issue_number,
-            project=project.name,
+            title=title,
         )
         run_command(create_worktree_command, cwd=project.paths.repo_root)
     except CommandError as exc:
@@ -300,6 +780,11 @@ def claim(
         print_error(location_message)
         raise typer.Exit(1)
 
+    mandate_path = run_dir / "mandate.md"
+    launch_prompt_path = run_dir / "launch_prompt.md"
+    mandate_path.write_text(body, encoding="utf-8")
+    ensure_conversation_files(run_dir)
+
     try:
         maybe_initialize_mandate_metadata(
             project,
@@ -307,15 +792,12 @@ def claim(
             slug=slug,
             agent=agent,
             issue=issue_number,
+            title=title,
+            active_branch_override=resolve_active_branch(project),
         )
     except CommandError as exc:
         print_error(str(exc))
         raise typer.Exit(1) from exc
-
-    mandate_path = run_dir / "mandate.md"
-    launch_prompt_path = run_dir / "launch_prompt.md"
-    mandate_path.write_text(body, encoding="utf-8")
-    ensure_conversation_files(run_dir)
 
     agent_state = {
         "project": project.name,
@@ -464,8 +946,62 @@ def start(
 
 
 @app.command(help="Show diff summary, run preflight, and recommend finish or fix.")
-def check(agent: str, project: str = typer.Option(...)) -> None:
+def check(
+    agent: str,
+    project: str = typer.Option(...),
+    repair: bool = typer.Option(False, "--repair"),
+    repair_only: bool = typer.Option(False, "--repair-only"),
+    active_branch: str | None = typer.Option(None, "--active-branch"),
+) -> None:
+    if repair_only:
+        repair = True
+
     diff(agent=agent, project=project, save=True)
+
+    try:
+        agent_state = load_agent_state(project, agent)
+    except (FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    project_file_value = agent_state.get("project_file")
+    if not isinstance(project_file_value, str) or not project_file_value:
+        print_error("Agent state does not include project_file.")
+        raise typer.Exit(1)
+
+    try:
+        project_config = load_project_config(Path(project_file_value))
+    except ConfigError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    finding = detect_missing_mandate_metadata(
+        project_config,
+        agent_state,
+        active_branch_override=active_branch,
+    )
+    if finding is not None:
+        if repair:
+            repair_result = repair_missing_mandate_metadata(
+                project_config,
+                agent_state,
+                dry_run=False,
+                allow_stash=True,
+                active_branch_override=active_branch,
+            )
+            console.print(f"Repair log: {repair_result.log_path}")
+            if not repair_result.success:
+                print_error(repair_result.message)
+                raise typer.Exit(1)
+            console.print("Repair completed.")
+            if repair_only:
+                console.print(f"Next: cascade check {agent} --project {project}")
+                return
+        else:
+            print_error(finding.message)
+            console.print(f"Repair available: cascade repair {agent} --project {project}")
+            console.print(f"Or run: cascade check {agent} --project {project} --repair")
+            raise typer.Exit(1)
 
     preflight_exit_code = 0
     try:
@@ -487,6 +1023,49 @@ def check(agent: str, project: str = typer.Option(...)) -> None:
     gate_summary(agent=agent, project=project)
     console.print(f"Next: cascade fix {agent} --project {project} --profile debugger")
     raise typer.Exit(preflight_exit_code or 1)
+
+
+@app.command(help="Repair known safe workflow setup failures without invoking models.")
+def repair(
+    agent: str,
+    project: str = typer.Option(...),
+    kind: RepairKind = typer.Option(RepairKind.auto, "--kind"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    yes: bool = typer.Option(False, "--yes"),
+    active_branch: str | None = typer.Option(None, "--active-branch"),
+) -> None:
+    del yes
+    try:
+        agent_state = load_agent_state(project, agent)
+    except (FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    project_file_value = agent_state.get("project_file")
+    if not isinstance(project_file_value, str) or not project_file_value:
+        print_error("Agent state does not include project_file.")
+        raise typer.Exit(1)
+
+    try:
+        project_config = load_project_config(Path(project_file_value))
+    except ConfigError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    result = run_repair(
+        project_config,
+        agent_state,
+        kind=kind,
+        dry_run=dry_run,
+        allow_stash=True,
+        active_branch_override=active_branch,
+    )
+    console.print(f"Repair log: {result.log_path}")
+    if not result.success:
+        print_error(result.message)
+        raise typer.Exit(1)
+    console.print(result.message)
+    console.print(f"Next: cascade check {agent} --project {project}")
 
 
 @app.command(help="Prepare fix context from the latest gate failure and optionally launch OpenCode.")
@@ -1333,6 +1912,31 @@ def prepare_model_call(
     help="Classify the latest gate failure from saved logs (deterministic, no model).",
 )
 def gate_summary(agent: str, project: str = typer.Option(...)) -> None:
+    try:
+        agent_state = load_agent_state(project, agent)
+    except (FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    project_file_value = agent_state.get("project_file")
+    if isinstance(project_file_value, str) and project_file_value:
+        try:
+            project_config = load_project_config(Path(project_file_value))
+            finding = detect_missing_mandate_metadata(project_config, agent_state)
+        except ConfigError:
+            finding = None
+        if finding is not None:
+            table = Table(title=f"Gate Summary: {project}/{agent}")
+            table.add_column("Field")
+            table.add_column("Value")
+            table.add_row("Detected failure", "yes")
+            table.add_row("Hook / check", "mandate-metadata")
+            table.add_row("Category", "workflow")
+            table.add_row("Model recommended", "no")
+            table.add_row("Suggested action", f"cascade repair {agent} --project {project}")
+            console.print(table)
+            return
+
     run_dir = get_agent_run_dir(project, agent)
     log_path = run_dir / "preflight.log"
 
@@ -1523,6 +2127,7 @@ def preflight(agent: str, project: str = typer.Option(...)) -> None:
             str(agent_state["slug"]),
             agent=agent,
             issue=int(agent_state["issue"]),
+            title=str(agent_state["title"]),
         )
     except FileNotFoundError as exc:
         print_error(str(exc))
@@ -1535,6 +2140,15 @@ def preflight(agent: str, project: str = typer.Option(...)) -> None:
         slug=str(agent_state["slug"]),
         issue=str(agent_state["issue"]),
         project=project,
+    )
+    preflight_command = format_command_template(
+        project_config.commands.preflight,
+        project=project_config,
+        agent=agent,
+        slug=str(agent_state["slug"]),
+        issue=int(agent_state["issue"]),
+        title=str(agent_state.get("title", "")),
+        canonical_mandate=get_agent_run_dir(project, agent) / "mandate.md",
     )
     result = subprocess.run(
         preflight_command,

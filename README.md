@@ -29,6 +29,7 @@ Cascade intentionally keeps most steps deterministic. Model calls are reserved f
 | `diff` | no | no | deterministic git summary |
 | `logs` | no | no | run artifact output |
 | `preflight` | no | no | deterministic configured validation run |
+| `repair` | no | no | deterministic safe workflow repair actions |
 | `capabilities` | no | no | command category and capability matrix |
 | `run-agent` | yes | yes | OpenCode interactive session |
 | `chat` | yes | yes | OpenCode interactive session with optional mode |
@@ -43,6 +44,36 @@ Cascade intentionally keeps most steps deterministic. Model calls are reserved f
 3. Start the agent session with `cascade run-agent`.
 4. Cascade launches OpenCode in the assigned worktree and loads the generated prompt automatically when available.
 5. Track progress with `cascade status` and `cascade mark`.
+
+## Self-healing workflow repairs
+
+Cascade includes deterministic, model-free repair flows for common workflow setup failures.
+
+Supported today:
+
+- missing mandate metadata file in the claimed worktree (`.github/mandates/<slug>.json`)
+
+Primary commands:
+
+```bash
+cascade repair a1 --project jungle
+cascade check a1 --project jungle --repair
+cascade check a1 --project jungle --repair-only
+```
+
+Behavior guarantees:
+
+- runs inside the same Docker-backed context as other `cascade` wrapper commands
+- does not call OpenCode or any model API
+- does not push to remotes
+- writes a repair log under the agent run directory
+
+Dirty-worktree safety:
+
+- when a safe repair requires clean state, Cascade stashes local changes (`git stash push -u`)
+- runs the repair command
+- attempts `git stash pop` after repair
+- if stash restore conflicts, Cascade keeps the stash entry and prints guidance instead of dropping data
 
 ## Requirements
 

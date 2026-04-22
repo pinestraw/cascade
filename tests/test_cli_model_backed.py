@@ -427,19 +427,21 @@ def test_claim_runs_configured_init_mandate_after_worktree_creation(
         f"""
 name: jungle
 github:
-  owner: pinestraw
-  repo: jungle
+    owner: pinestraw
+    repo: jungle
 paths:
-  repo_root: {tmp_path / "repo"}
-  worktree_root: {tmp_path / "worktrees"}
+    repo_root: {tmp_path / "repo"}
+    worktree_root: {tmp_path / "worktrees"}
+branches:
+    active_branch: staging
 commands:
-  create_worktree: custom-create --agent={{agent}} --slug={{slug}}
-  init_mandate: make mandate-init MANDATE_SLUG={{slug}}
-  preflight: make mandate-preflight MANDATE_SLUG={{slug}}
+    create_worktree: custom-create --agent={{agent}} --slug={{slug}}
+    init_mandate: make mandate-start MANDATE_SLUG={{slug}} MANDATE_TITLE='{{title}}' MANDATE_ACTIVE_BRANCH={{active_branch_shell}}
+    preflight: make mandate-preflight MANDATE_SLUG={{slug}}
 models:
-  default:
-    provider: openrouter
-    model: z-ai/glm-4.7-flash
+    default:
+        provider: openrouter
+        model: z-ai/glm-4.7-flash
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -455,7 +457,7 @@ models:
         if "custom-create" in cmd:
             worktree = worktrees / "oc1-test-issue"
             (worktree / ".github" / "mandates").mkdir(parents=True, exist_ok=True)
-        if "make mandate-init" in cmd:
+        if "make mandate-start" in cmd:
             metadata = worktrees / "oc1-test-issue" / ".github" / "mandates" / "test-issue.json"
             metadata.write_text("{}\n", encoding="utf-8")
 
@@ -485,7 +487,8 @@ models:
     assert result.exit_code == 0, result.output
     assert [cmd for cmd, _cwd in commands] == [
         "custom-create --agent=oc1 --slug=test-issue",
-        "make mandate-init MANDATE_SLUG=test-issue",
+        "git status --porcelain",
+        "make mandate-start MANDATE_SLUG=test-issue MANDATE_TITLE='Test Issue' MANDATE_ACTIVE_BRANCH=staging",
     ]
     assert commands[1][1] == worktrees / "oc1-test-issue"
     assert (worktrees / "oc1-test-issue" / ".github" / "mandates" / "test-issue.json").exists()

@@ -232,9 +232,22 @@ def classify_gate_failure(log_text: str) -> dict[str, object]:
             "model_recommended": False,
         }
 
+    workflow_markers = [
+        "required mandate metadata is missing",
+        "canonical mandate file is missing",
+    ]
+    log_lower = log_text.lower()
+    if any(marker in log_lower for marker in workflow_markers):
+        return {
+            "detected": True,
+            "hook": "mandate-metadata",
+            "category": "workflow",
+            "suggested_no_model_action": "Run `cascade repair <agent> --project <project>`.",
+            "model_recommended": False,
+        }
+
     failed_hooks = _extract_failed_hooks(log_text)
     # Also search the full log text for hook name substrings
-    log_lower = log_text.lower()
 
     # Try to match against known patterns
     for hook_name in failed_hooks:

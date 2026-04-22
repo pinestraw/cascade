@@ -271,7 +271,42 @@ def test_preflight_detects_missing_mandate_metadata_with_specific_guidance(
     worktree, _run_dir = _setup_agent(
         tmp_path,
         preflight_cmd="make mandate-preflight MANDATE_SLUG={slug}",
-        init_mandate_cmd="make mandate-init MANDATE_SLUG={slug}",
+        init_mandate_cmd="make mandate-start MANDATE_SLUG={slug} MANDATE_TITLE='{title}'",
+    )
+    (_run_dir / "mandate.md").write_text("# Mandate\n", encoding="utf-8")
+    (worktree / ".github" / "mandates").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda cmd, **kwargs: (_ for _ in ()).throw(AssertionError("preflight command must not run before metadata check"))
+        if isinstance(cmd, str) and "mandate-preflight" in cmd
+        else type("_Result", (), {"returncode": 0, "stdout": "ok"})(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "ensure_opencode_available",
+        lambda: (_ for _ in ()).throw(AssertionError("preflight must not check OpenCode")),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["preflight", "oc1", "--project", "jungle"])
+    normalized_output = " ".join(result.output.split())
+
+    assert result.exit_code != 0
+    assert ".github/mandates/test-feature.json" in normalized_output
+    assert "Repair available: cascade repair oc1 --project jungle" in normalized_output
+    assert "Required mandate metadata is missing" in normalized_output
+
+
+def test_preflight_missing_mandate_metadata_without_init_command_has_no_fake_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    worktree, _run_dir = _setup_agent(
+        tmp_path,
+        preflight_cmd="make mandate-preflight MANDATE_SLUG={slug}",
+        init_mandate_cmd=None,
     )
     (worktree / ".github" / "mandates").mkdir(parents=True)
 
@@ -290,11 +325,21 @@ def test_preflight_detects_missing_mandate_metadata_with_specific_guidance(
 
     runner = CliRunner()
     result = runner.invoke(app, ["preflight", "oc1", "--project", "jungle"])
+    normalized_output = " ".join(result.output.split())
 
     assert result.exit_code != 0
-    assert ".github/mandates/test-feature.json" in result.output
-    assert "make mandate-init MANDATE_SLUG=test-feature" in result.output
-    assert "Required mandate metadata is missing" in result.output
+    assert (
+        "Missing mandate start command config: set one of commands.mandate_start, commands.start_mandate, or commands.init_mandate."
+        in normalized_output
+    )
+    assert "mandate-init" not in normalized_output
+
+
+def test_gate_classify_missing_mandate_metadata_is_workflow_no_model() -> None:
+    log = "Required mandate metadata is missing: /workspace/jungle-worktrees/a1/foo/.github/mandates/foo.json"
+    result = classify_gate_failure(log)
+    assert result["category"] == "workflow"
+    assert result["model_recommended"] is False
 
 
 # ---------------------------------------------------------------------------

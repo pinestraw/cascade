@@ -232,3 +232,105 @@ def test_doctor_reports_missing_host_docker_access_in_container(
     assert "Docker CLI missing" in docker_cli_check.details
     assert docker_socket_check.status == "fail"
     assert "/var/run/docker.sock" in docker_socket_check.details
+
+
+def test_doctor_reports_init_mandate_target_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (tmp_path / "worktrees").mkdir()
+    (repo / "Makefile").write_text("mandate-start:\n\t@echo ok\n", encoding="utf-8")
+
+    project_file = tmp_path / "project.yaml"
+    project_file.write_text(
+        """
+name: jungle
+github:
+    owner: pinestraw
+    repo: jungle
+paths:
+    repo_root: ./repo
+    worktree_root: ./worktrees
+commands:
+    create_worktree: echo create
+    mandate_start: make mandate-start MANDATE_SLUG={slug}
+models:
+    default:
+        provider: openrouter
+        model: z-ai/glm-4.7-flash
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def _which(name: str):
+        if name == "gh":
+            return "/usr/bin/gh"
+        if name == "opencode":
+            return "/usr/local/bin/opencode"
+        return None
+
+    class _Completed:
+        returncode = 0
+        stdout = "authenticated"
+
+    monkeypatch.setattr("cascade.doctor.shutil.which", _which)
+    monkeypatch.setattr("cascade.doctor.subprocess.run", lambda *args, **kwargs: _Completed())
+    monkeypatch.setattr("cascade.doctor._running_in_docker", lambda: False)
+
+    checks = run_doctor_checks(project_file)
+    init_check = next(check for check in checks if check.name == "mandate_start target")
+
+    assert init_check.status == "ok"
+    assert "mandate-start" in init_check.details
+
+
+def test_doctor_warns_when_init_mandate_target_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (tmp_path / "worktrees").mkdir()
+    (repo / "Makefile").write_text("other-target:\n\t@echo ok\n", encoding="utf-8")
+
+    project_file = tmp_path / "project.yaml"
+    project_file.write_text(
+        """
+name: jungle
+github:
+    owner: pinestraw
+    repo: jungle
+paths:
+    repo_root: ./repo
+    worktree_root: ./worktrees
+commands:
+    create_worktree: echo create
+    start_mandate: make mandate-start MANDATE_SLUG={slug}
+models:
+    default:
+        provider: openrouter
+        model: z-ai/glm-4.7-flash
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def _which(name: str):
+        if name == "gh":
+            return "/usr/bin/gh"
+        if name == "opencode":
+            return "/usr/local/bin/opencode"
+        return None
+
+    class _Completed:
+        returncode = 0
+        stdout = "authenticated"
+
+    monkeypatch.setattr("cascade.doctor.shutil.which", _which)
+    monkeypatch.setattr("cascade.doctor.subprocess.run", lambda *args, **kwargs: _Completed())
+    monkeypatch.setattr("cascade.doctor._running_in_docker", lambda: False)
+
+    checks = run_doctor_checks(project_file)
+    init_check = next(check for check in checks if check.name == "mandate_start target")
+
+    assert init_check.status == "warn"
+    assert "but it was not found" in init_check.details

@@ -18,7 +18,13 @@ NO_MODEL_COMMANDS: dict[str, CommandMeta] = {
         "mutates_target_repo": False,
     },
     "check": {
-        "description": "Show diff, run preflight, and recommend finish or fix.",
+        "description": "Show diff, run preflight, and optionally perform safe workflow repairs.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": True,
+    },
+    "repair": {
+        "description": "Run known safe deterministic workflow repairs (no model calls).",
         "requires_opencode": False,
         "requires_gh": False,
         "mutates_target_repo": True,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -61,6 +63,36 @@ def _origin_default_branch(repo_root: Path) -> str | None:
     if not value.startswith("origin/"):
         return None
     return value.split("/", maxsplit=1)[1]
+
+
+def _extract_make_target(command: str) -> str | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not tokens or tokens[0] != "make":
+        return None
+
+    for token in tokens[1:]:
+        if token.startswith("-"):
+            continue
+        if "=" in token:
+            continue
+        return token
+    return None
+
+
+def _makefile_has_target(makefile_path: Path, target: str) -> bool:
+    if not makefile_path.exists():
+        return False
+    pattern = re.compile(rf"^\s*{re.escape(target)}\s*:")
+    try:
+        for line in makefile_path.read_text(encoding="utf-8").splitlines():
+            if pattern.match(line):
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def run_doctor_checks(project_file: Path) -> list[DoctorCheck]:
@@ -261,6 +293,45 @@ def run_doctor_checks(project_file: Path) -> list[DoctorCheck]:
         return checks
 
     checks.append(DoctorCheck(name="project config", status="ok", details=f"Loaded project '{project.name}'"))
+
+    mandate_command_template = (
+        project.commands.mandate_start
+        or project.commands.start_mandate
+        or project.commands.init_mandate
+    )
+    if mandate_command_template is not None:
+        makefile_path = project.paths.repo_root / "Makefile"
+        target = _extract_make_target(mandate_command_template)
+        if target is None:
+            checks.append(
+                DoctorCheck(
+                    name="mandate_start target",
+                    status="warn",
+                    details=(
+                        "A mandate-start command is configured, but no Make target could be parsed. "
+                        "Verify the command manually."
+                    ),
+                )
+            )
+        elif _makefile_has_target(makefile_path, target):
+            checks.append(
+                DoctorCheck(
+                    name="mandate_start target",
+                    status="ok",
+                    details=f"Found Make target '{target}' in {makefile_path}",
+                )
+            )
+        else:
+            checks.append(
+                DoctorCheck(
+                    name="mandate_start target",
+                    status="warn",
+                    details=(
+                        f"Configured mandate-start command references make target '{target}', "
+                        f"but it was not found in {makefile_path}."
+                    ),
+                )
+            )
 
     gh_required = bool(project.github.owner and project.github.repo)
     checks.append(

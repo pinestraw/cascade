@@ -27,6 +27,8 @@ class InstructionsConfig(BaseModel):
 
 class CommandsConfig(BaseModel):
     create_worktree: str
+    mandate_start: str | None = None
+    start_mandate: str | None = None
     init_mandate: str | None = None
     preflight: str | None = None
     done: str | None = None
@@ -34,6 +36,8 @@ class CommandsConfig(BaseModel):
 
 
 class BranchesConfig(BaseModel):
+    active_branch: str | None = None
+    base: str | None = None
     agent_branch_template: str | None = None
 
 
@@ -139,6 +143,7 @@ class RetryPolicyConfig(BaseModel):
 
 class ProjectConfig(BaseModel):
     name: str
+    default_active_branch: str | None = None
     github: GithubConfig
     paths: PathsConfig
     related_repos: dict[str, Path] = Field(default_factory=dict)
