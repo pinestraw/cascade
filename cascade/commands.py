@@ -71,6 +71,42 @@ NO_MODEL_COMMANDS: dict[str, CommandMeta] = {
         "requires_gh": False,
         "mutates_target_repo": True,
     },
+    "gate-status": {
+        "description": "Show latest gate result and staleness for an agent.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": False,
+    },
+    "gate-summary": {
+        "description": "Classify latest gate failure from log without calling a model.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": False,
+    },
+    "context-pack": {
+        "description": "Build a bounded deterministic context pack for a model-backed task.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": False,
+    },
+    "estimate-cost": {
+        "description": "Estimate model call cost from context pack and profile.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": False,
+    },
+    "prepare-model-call": {
+        "description": "Prepare prompt and cost estimate for a model-backed task (no model call).",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": False,
+    },
+    "budget-status": {
+        "description": "Show attempt counts, token estimates, and gate state.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": False,
+    },
     "capabilities": {
         "description": "List command categories and required capabilities.",
         "requires_opencode": False,

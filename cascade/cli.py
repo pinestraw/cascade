@@ -9,8 +9,20 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from cascade.config import ConfigError, ProjectConfig, instruction_file_paths, load_project_config
+from cascade.config import (
+    ConfigError,
+    ModelProfile,
+    ProjectConfig,
+    get_model_profile,
+    instruction_file_paths,
+    load_project_config,
+    model_id_for_opencode,
+    resolve_model_for_task,
+)
 from cascade.commands import MODEL_BACKED_COMMANDS, NO_MODEL_COMMANDS, PLANNED_MODEL_BACKED_COMMANDS
+from cascade.context_pack import ALLOWED_TASKS, build_context_pack, save_context_pack
+from cascade.costs import DEFAULT_EXPECTED_OUTPUT_TOKENS, cost_summary_lines, estimate_cost, estimate_tokens
+from cascade.prompts import build_launch_prompt, build_task_prompt
 from cascade.conversation import (
     append_markdown_entry,
     build_ask_prompt,
@@ -30,15 +42,27 @@ from cascade.opencode import (
     ensure_opencode_available,
     run_prompt,
 )
-from cascade.prompts import build_launch_prompt
 from cascade.shell import CommandError, run_command
 from cascade.state import (
     ensure_project_state_dirs,
     get_agent_run_dir,
+    increment_attempt,
+    get_attempt_count,
     load_agent_state,
     save_agent_state,
     list_agent_states,
     update_agent_state,
+)
+from cascade.gates import (
+    build_failure_summary,
+    check_gate_staleness,
+    classify_gate_failure,
+    get_diff_fingerprint,
+    get_git_head_sha,
+    get_touched_files,
+    gate_status_line,
+    load_gate_result,
+    save_gate_result,
 )
 from cascade.standards import (
     get_current_branch,
@@ -268,9 +292,16 @@ def status(project: str = typer.Option(...)) -> None:
     table.add_column("Engine")
     table.add_column("Model")
     table.add_column("State")
+    table.add_column("Gate")
     table.add_column("Worktree")
 
     for item in states:
+        worktree_str = str(item.get("worktree", ""))
+        worktree_path = Path(worktree_str) if worktree_str else None
+        gate_result_path_str = str(item.get("gate_result_path", ""))
+        gate_result: dict[str, object] | None = None
+        if gate_result_path_str:
+            gate_result = load_gate_result(Path(gate_result_path_str).parent)
         table.add_row(
             str(item.get("agent", "")),
             str(item.get("issue", "")),
@@ -278,7 +309,8 @@ def status(project: str = typer.Option(...)) -> None:
             str(item.get("engine", "")),
             str(item.get("model", "")),
             str(item.get("state", "")),
-            str(item.get("worktree", "")),
+            gate_status_line(gate_result, worktree_path),
+            worktree_str,
         )
     console.print(table)
 
@@ -381,6 +413,23 @@ def context(
     git_diff_stat = get_git_diff_stat(worktree)
     git_branch = get_current_branch(worktree)
 
+    # Load gate result and compute staleness deterministically.
+    gate_result_path_str = str(agent_state.get("gate_result_path", ""))
+    gate_result: dict[str, object] | None = None
+    if gate_result_path_str:
+        gate_result = load_gate_result(Path(gate_result_path_str).parent)
+    gate_line = gate_status_line(gate_result, worktree)
+
+    gate_section_lines: list[str] = [f"- Status: {gate_line}"]
+    if gate_result is not None:
+        gate_section_lines.append(f"- Timestamp: {gate_result.get('timestamp', '(unknown)')}")
+        gate_section_lines.append(f"- Exit code: {gate_result.get('exit_code', '(unknown)')}")
+        gate_section_lines.append(f"- Log: {gate_result.get('log_path', '(unknown)')}")
+        failure_summary = gate_result.get("failure_summary")
+        if failure_summary:
+            gate_section_lines.append(f"\nFailure summary:\n{failure_summary}")
+    gate_section = "\n".join(gate_section_lines)
+
     context_body = (
         f"# Cascade Context\n\n"
         f"## Agent Metadata\n"
@@ -395,6 +444,7 @@ def context(
         f"## Configured Instruction Files\n"
         + "\n".join(f"- {item}" for item in configured_instruction_files)
         + "\n\n"
+        f"## Gate Result\n\n{gate_section}\n\n"
         f"## Mandate\n\n{mandate or '(none)'}\n\n"
         f"## Decisions\n\n{decisions or '(none)'}\n\n"
         f"## Questions\n\n{questions or '(none)'}\n\n"
@@ -466,11 +516,428 @@ def diff(
 @app.command()
 def mark(agent: str, project: str = typer.Option(...), state: AgentLifecycleState = typer.Option(...)) -> None:
     try:
+        agent_state = load_agent_state(project, agent)
+    except (FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    if state == AgentLifecycleState.closeout_ready:
+        # Closeout readiness requires a passing, non-stale gate result.
+        gate_result_path_str = str(agent_state.get("gate_result_path", ""))
+        gate_result: dict[str, object] | None = None
+        if gate_result_path_str:
+            gate_result = load_gate_result(Path(gate_result_path_str).parent)
+
+        if gate_result is None:
+            print_error(
+                "Cannot mark closeout_ready: no gate result found. "
+                "Run `cascade preflight` first."
+            )
+            raise typer.Exit(1)
+
+        if not gate_result.get("passed"):
+            exit_code = gate_result.get("exit_code", "?")
+            print_error(
+                f"Cannot mark closeout_ready: last gate run failed (exit {exit_code}). "
+                "Run `cascade preflight` and ensure it passes at the current HEAD/diff."
+            )
+            raise typer.Exit(1)
+
+        worktree_str = str(agent_state.get("worktree", ""))
+        if worktree_str:
+            worktree = Path(worktree_str)
+            is_stale, reason = check_gate_staleness(gate_result, worktree)
+            if is_stale:
+                print_error(
+                    f"Cannot mark closeout_ready: gate result is stale — {reason} "
+                    "Rerun `cascade preflight` at the current HEAD/diff."
+                )
+                raise typer.Exit(1)
+
+    try:
         updated = update_agent_state(project, agent, state.value)
     except (FileNotFoundError, ValueError) as exc:
         print_error(str(exc))
         raise typer.Exit(1) from exc
     console.print(f"Updated agent {agent} in project {project} to state '{updated['state']}'.")
+
+
+@app.command(
+    name="gate-status",
+    help="Show latest gate result and staleness for an agent (deterministic, no model).",
+)
+def gate_status(agent: str, project: str = typer.Option(...)) -> None:
+    """Read and display the saved gate result.  Exit 1 if gate failed or is stale."""
+    try:
+        agent_state = load_agent_state(project, agent)
+    except (FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    worktree_str = str(agent_state.get("worktree", ""))
+    worktree = Path(worktree_str) if worktree_str else None
+
+    gate_result_path_str = str(agent_state.get("gate_result_path", ""))
+    gate_result: dict[str, object] | None = None
+    if gate_result_path_str:
+        gate_result = load_gate_result(Path(gate_result_path_str).parent)
+
+    if gate_result is None:
+        console.print("[yellow]No gate result found.[/yellow] Run `cascade preflight` first.")
+        raise typer.Exit(1)
+
+    table = Table(title=f"Gate Status: {project}/{agent}")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("Timestamp", str(gate_result.get("timestamp", "(unknown)")))
+    table.add_row("Command", str(gate_result.get("command", "(unknown)")))
+    table.add_row("Exit code", str(gate_result.get("exit_code", "(unknown)")))
+    table.add_row("Passed", "yes" if gate_result.get("passed") else "no")
+    table.add_row("Log file", str(gate_result.get("log_path", "(unknown)")))
+    table.add_row("HEAD SHA", str(gate_result.get("git_head_sha", "(unknown)")))
+
+    touched_raw = gate_result.get("touched_files", [])
+    touched = list(touched_raw) if isinstance(touched_raw, list) else []
+    table.add_row("Touched files", ", ".join(touched) if touched else "(none)")
+
+    is_stale = False
+    if worktree is not None and worktree.exists():
+        is_stale, stale_reason = check_gate_staleness(gate_result, worktree)
+        table.add_row("Stale", f"yes — {stale_reason}" if is_stale else "no")
+    else:
+        table.add_row("Stale", "(worktree not found; cannot check)")
+
+    console.print(table)
+
+    failure_summary = gate_result.get("failure_summary")
+    if failure_summary:
+        console.print("\n[yellow]Failure summary:[/yellow]")
+        console.print(str(failure_summary))
+
+    if not gate_result.get("passed") or is_stale:
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# context-pack: deterministic context pack builder
+# ---------------------------------------------------------------------------
+
+_TASK_CHOICES = sorted(ALLOWED_TASKS)
+
+
+@app.command(
+    name="context-pack",
+    help="Build a bounded, deterministic context pack for a model-backed task (no model call).",
+)
+def context_pack(
+    agent: str,
+    project: str = typer.Option(...),
+    task: str = typer.Option(..., help=f"Task type: {', '.join(_TASK_CHOICES)}"),
+    print_output: bool = typer.Option(False, "--print"),
+    include_diff: bool = typer.Option(False, "--include-diff"),
+) -> None:
+    if task not in ALLOWED_TASKS:
+        print_error(f"Unknown task '{task}'. Allowed: {', '.join(_TASK_CHOICES)}")
+        raise typer.Exit(1)
+
+    try:
+        agent_state = load_agent_state(project, agent)
+    except (FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    project_file_value = agent_state.get("project_file")
+    if not isinstance(project_file_value, str) or not project_file_value:
+        print_error("Agent state does not include project_file. Re-claim the issue.")
+        raise typer.Exit(1)
+
+    try:
+        project_config = load_project_config(Path(project_file_value))
+    except ConfigError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    run_dir = get_agent_run_dir(project, agent)
+    try:
+        pack = build_context_pack(project_config, agent_state, task, run_dir, include_diff=include_diff)
+    except ValueError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    md_path, json_path = save_context_pack(run_dir, pack)
+
+    console.print(f"Context pack  : {md_path}")
+    console.print(f"Metadata      : {json_path}")
+    console.print(f"Est. tokens   : ~{pack.estimated_input_tokens:,}")
+    console.print(f"Budget        : {pack.max_input_tokens:,}")
+    if pack.truncated:
+        console.print("[yellow]Warning: context was truncated to fit token budget.[/yellow]")
+    for warning in pack.warnings:
+        print_warning(warning)
+    if print_output:
+        console.print(pack.body)
+
+
+# ---------------------------------------------------------------------------
+# estimate-cost: deterministic cost estimator
+# ---------------------------------------------------------------------------
+
+
+@app.command(
+    name="estimate-cost",
+    help="Estimate model cost for a task based on context pack and profile (no model call).",
+)
+def estimate_cost_cmd(
+    agent: str,
+    project: str = typer.Option(...),
+    task: str = typer.Option(...),
+    profile: str = typer.Option(...),
+    expected_output_tokens: int = typer.Option(0, "--expected-output-tokens"),
+) -> None:
+    if task not in ALLOWED_TASKS:
+        print_error(f"Unknown task '{task}'. Allowed: {', '.join(_TASK_CHOICES)}")
+        raise typer.Exit(1)
+
+    try:
+        agent_state = load_agent_state(project, agent)
+    except (FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    project_file_value = agent_state.get("project_file")
+    if not isinstance(project_file_value, str) or not project_file_value:
+        print_error("Agent state does not include project_file.")
+        raise typer.Exit(1)
+
+    try:
+        project_config = load_project_config(Path(project_file_value))
+    except ConfigError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    try:
+        model_profile = get_model_profile(project_config, profile)
+    except ConfigError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    # Resolve context pack (build fresh or read existing)
+    run_dir = get_agent_run_dir(project, agent)
+    context_pack_md = run_dir / f"context_{task}.md"
+    if context_pack_md.exists():
+        input_tokens = estimate_tokens(context_pack_md.read_text(encoding="utf-8"))
+    else:
+        try:
+            pack = build_context_pack(project_config, agent_state, task, run_dir)
+            save_context_pack(run_dir, pack)
+            input_tokens = pack.estimated_input_tokens
+        except ValueError as exc:
+            print_error(str(exc))
+            raise typer.Exit(1) from exc
+
+    output_tokens = expected_output_tokens or DEFAULT_EXPECTED_OUTPUT_TOKENS.get(task, 10000)
+    lines = cost_summary_lines(input_tokens, output_tokens, model_profile, profile)
+    for line in lines:
+        console.print(line)
+
+
+# ---------------------------------------------------------------------------
+# prepare-model-call: build prompt + metadata without calling a model
+# ---------------------------------------------------------------------------
+
+
+@app.command(
+    name="prepare-model-call",
+    help="Build task prompt and cost metadata for a model-backed call (no model call).",
+)
+def prepare_model_call(
+    agent: str,
+    project: str = typer.Option(...),
+    task: str = typer.Option(...),
+    profile: str = typer.Option(...),
+    include_diff: bool = typer.Option(False, "--include-diff"),
+) -> None:
+    import json as _json
+
+    if task not in ALLOWED_TASKS:
+        print_error(f"Unknown task '{task}'. Allowed: {', '.join(_TASK_CHOICES)}")
+        raise typer.Exit(1)
+
+    try:
+        agent_state = load_agent_state(project, agent)
+    except (FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    project_file_value = agent_state.get("project_file")
+    if not isinstance(project_file_value, str) or not project_file_value:
+        print_error("Agent state does not include project_file.")
+        raise typer.Exit(1)
+
+    try:
+        project_config = load_project_config(Path(project_file_value))
+    except ConfigError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    try:
+        model_profile = get_model_profile(project_config, profile)
+    except ConfigError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    run_dir = get_agent_run_dir(project, agent)
+
+    # Build context pack
+    try:
+        pack = build_context_pack(project_config, agent_state, task, run_dir, include_diff=include_diff)
+        save_context_pack(run_dir, pack)
+    except ValueError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    # Build prompt
+    prompt_body = build_task_prompt(pack.body, task)
+    prompt_path = run_dir / f"{task}_prompt.md"
+    prompt_path.write_text(prompt_body, encoding="utf-8")
+
+    # Cost estimate
+    input_tokens = pack.estimated_input_tokens
+    output_tokens = DEFAULT_EXPECTED_OUTPUT_TOKENS.get(task, 10000)
+    cost_usd = estimate_cost(input_tokens, output_tokens, model_profile)
+    model_id = model_id_for_opencode(model_profile)
+    ts = timestamp_utc()
+
+    metadata: dict[str, object] = {
+        "task_type": task,
+        "profile": profile,
+        "model_id": model_id,
+        "estimated_input_tokens": input_tokens,
+        "expected_output_tokens": output_tokens,
+        "estimated_cost_usd": round(cost_usd, 6),
+        "generated_at": ts,
+    }
+    meta_path = run_dir / f"{task}_model_call.json"
+    meta_path.write_text(_json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+    console.print(f"Prompt file   : {prompt_path}")
+    console.print(f"Metadata      : {meta_path}")
+    console.print(f"Model         : {model_id}")
+    console.print(f"Est. tokens   : ~{input_tokens:,} in / ~{output_tokens:,} out")
+    from cascade.costs import format_cost
+    console.print(f"Est. cost     : {format_cost(cost_usd)}")
+    console.print(
+        "Tip: pass this model string to OpenCode with "
+        f"`opencode . --model {model_id}`"
+    )
+    console.print("Note: costs are approximations — verify at https://openrouter.ai/models")
+
+
+# ---------------------------------------------------------------------------
+# gate-summary: classify and display latest gate failure
+# ---------------------------------------------------------------------------
+
+
+@app.command(
+    name="gate-summary",
+    help="Classify the latest gate failure from saved logs (deterministic, no model).",
+)
+def gate_summary(agent: str, project: str = typer.Option(...)) -> None:
+    run_dir = get_agent_run_dir(project, agent)
+    log_path = run_dir / "preflight.log"
+
+    try:
+        log_content = log_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print_error(f"No preflight log found at {log_path}. Run `cascade preflight` first.")
+        raise typer.Exit(1)
+
+    classification = classify_gate_failure(log_content)
+
+    table = Table(title=f"Gate Summary: {project}/{agent}")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("Detected failure", "yes" if classification["detected"] else "no")
+    table.add_row("Hook / check", str(classification.get("hook") or "(unknown)"))
+    table.add_row("Category", str(classification.get("category", "unknown")))
+    table.add_row("Model recommended", "yes" if classification["model_recommended"] else "no")
+    table.add_row("Suggested action", str(classification.get("suggested_no_model_action", "")))
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# budget-status: show attempt counts, context estimates, gate state
+# ---------------------------------------------------------------------------
+
+
+@app.command(
+    name="budget-status",
+    help="Show attempt counts, context pack estimates, and gate state (no model).",
+)
+def budget_status(agent: str, project: str = typer.Option(...)) -> None:
+    import json as _json
+
+    try:
+        agent_state = load_agent_state(project, agent)
+    except (FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    worktree_str = str(agent_state.get("worktree", ""))
+    worktree = Path(worktree_str) if worktree_str else None
+
+    # Gate result
+    gate_result_path_str = str(agent_state.get("gate_result_path", ""))
+    gate_result: dict[str, object] | None = None
+    if gate_result_path_str:
+        gate_result = load_gate_result(Path(gate_result_path_str).parent)
+    gate_line = gate_status_line(gate_result, worktree)
+
+    run_dir = get_agent_run_dir(project, agent)
+
+    # Attempt tracking
+    attempts_raw = agent_state.get("attempts", {})
+    attempts = attempts_raw if isinstance(attempts_raw, dict) else {}
+
+    table = Table(title=f"Budget Status: {project}/{agent}")
+    table.add_column("Item")
+    table.add_column("Value")
+
+    table.add_row("Agent state", str(agent_state.get("state", "(unknown)")))
+    table.add_row("Gate", gate_line)
+
+    # Attempt counts
+    for task in ("plan", "implement", "diagnose", "fix", "review", "summarize"):
+        task_entry = attempts.get(task, {})
+        count = int(task_entry.get("count", 0)) if isinstance(task_entry, dict) else 0
+        last_profile = str(task_entry.get("last_profile") or "(none)") if isinstance(task_entry, dict) else "(none)"
+        table.add_row(f"Attempts: {task}", f"{count} (last profile: {last_profile})")
+
+    # Context pack token estimates from saved JSON files
+    for task in _TASK_CHOICES:
+        meta_json = run_dir / f"context_{task}.json"
+        if meta_json.exists():
+            try:
+                meta = _json.loads(meta_json.read_text(encoding="utf-8"))
+                est = meta.get("estimated_input_tokens", "?")
+                truncated = "(truncated)" if meta.get("truncated") else ""
+                table.add_row(f"Context pack: {task}", f"~{est:,} tokens {truncated}")
+            except (_json.JSONDecodeError, ValueError):
+                pass
+
+    # Model call metadata
+    for task in _TASK_CHOICES:
+        call_meta_json = run_dir / f"{task}_model_call.json"
+        if call_meta_json.exists():
+            try:
+                call_meta = _json.loads(call_meta_json.read_text(encoding="utf-8"))
+                cost = call_meta.get("estimated_cost_usd", "?")
+                model_id = call_meta.get("model_id", "?")
+                table.add_row(f"Est. cost: {task}", f"~${cost:.4f} USD ({model_id})")
+            except (_json.JSONDecodeError, ValueError):
+                pass
+
+    console.print(table)
 
 
 @app.command(help="List deterministic and model-backed command capabilities.")
@@ -577,20 +1044,53 @@ def preflight(agent: str, project: str = typer.Option(...)) -> None:
         text=True,
     )
     preflight_timestamp = timestamp_utc()
+    log_content = result.stdout or ""
     log_path.write_text(
         (
             f"# Preflight Run\n"
             f"timestamp: {preflight_timestamp}\n"
             f"command: {preflight_command}\n"
             f"exit_code: {result.returncode}\n\n"
-            f"{result.stdout}"
+            f"{log_content}"
         ),
         encoding="utf-8",
     )
 
+    passed = result.returncode == 0
+
+    # Capture git state at the moment the gate ran so staleness can be detected later.
+    head_sha = get_git_head_sha(worktree)
+    diff_fp = get_diff_fingerprint(worktree)
+    touched_files = get_touched_files(worktree)
+
+    gate_data: dict[str, object] = {
+        "timestamp": preflight_timestamp,
+        "command": preflight_command,
+        "exit_code": result.returncode,
+        "passed": passed,
+        "log_path": str(log_path),
+        "git_head_sha": head_sha,
+        "diff_fingerprint": diff_fp,
+        "touched_files": touched_files,
+        "failure_summary": (
+            None
+            if passed
+            else build_failure_summary(
+                {
+                    "command": preflight_command,
+                    "exit_code": result.returncode,
+                    "log_path": str(log_path),
+                    "touched_files": touched_files,
+                },
+                log_content,
+            )
+        ),
+    }
+    gate_result_path = save_gate_result(run_dir, gate_data)
+
     new_state = (
         AgentLifecycleState.preflight_passed.value
-        if result.returncode == 0
+        if passed
         else AgentLifecycleState.preflight_failed.value
     )
     updated_state = load_agent_state(project, agent)
@@ -598,9 +1098,16 @@ def preflight(agent: str, project: str = typer.Option(...)) -> None:
     updated_state["preflight_last_run_at"] = preflight_timestamp
     updated_state["preflight_last_exit_code"] = result.returncode
     updated_state["preflight_last_log"] = str(log_path)
+    updated_state["gate_result_path"] = str(gate_result_path)
     save_agent_state(project, agent, updated_state)
-    console.print(f"Preflight log: {log_path}")
-    if result.returncode != 0:
+
+    console.print(f"Preflight log  : {log_path}")
+    console.print(f"Gate result    : {gate_result_path}")
+    if not passed:
+        failure_summary = gate_data.get("failure_summary")
+        if failure_summary:
+            console.print("\n[yellow]Failure summary:[/yellow]")
+            console.print(str(failure_summary))
         print_error(f"Preflight failed with exit code {result.returncode}.")
         raise typer.Exit(1)
 

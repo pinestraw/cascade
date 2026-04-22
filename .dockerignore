@@ -1,0 +1,10 @@
+.git
+.venv
+.venv312
+__pycache__
+.pytest_cache
+state
+.env
+node_modules
+*.egg-info
+.DS_Store

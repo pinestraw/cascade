@@ -71,3 +71,87 @@ def update_agent_state(project_name: str, agent: str, new_state: str) -> dict[st
     state["state"] = new_state
     save_agent_state(project_name, agent, state)
     return state
+
+
+# ---------------------------------------------------------------------------
+# Retry / attempt tracking
+# ---------------------------------------------------------------------------
+
+_TRACKED_TASK_TYPES = ("plan", "implement", "diagnose", "fix", "review", "summarize")
+
+
+def _ensure_attempts(agent_state: dict[str, object]) -> dict[str, object]:
+    """Return the attempts sub-dict, creating it if absent."""
+    if not isinstance(agent_state.get("attempts"), dict):
+        agent_state["attempts"] = {
+            task: {"count": 0, "last_profile": None}
+            for task in _TRACKED_TASK_TYPES
+        }
+    attempts = agent_state["attempts"]
+    assert isinstance(attempts, dict)
+    for task in _TRACKED_TASK_TYPES:
+        if task not in attempts:
+            attempts[task] = {"count": 0, "last_profile": None}
+    return attempts
+
+
+def increment_attempt(
+    project_name: str,
+    agent: str,
+    task_type: str,
+    profile: str | None = None,
+) -> int:
+    """Increment attempt count for task_type; return the new count."""
+    state = load_agent_state(project_name, agent)
+    attempts = _ensure_attempts(state)
+    task_entry = attempts.get(task_type)
+    if not isinstance(task_entry, dict):
+        task_entry = {"count": 0, "last_profile": None}
+        attempts[task_type] = task_entry
+    task_entry["count"] = int(task_entry.get("count", 0)) + 1
+    task_entry["last_profile"] = profile
+    save_agent_state(project_name, agent, state)
+    return int(task_entry["count"])
+
+
+def get_attempt_count(project_name: str, agent: str, task_type: str) -> int:
+    """Return the current attempt count for task_type (0 if not started)."""
+    try:
+        state = load_agent_state(project_name, agent)
+    except (FileNotFoundError, ValueError):
+        return 0
+    attempts = state.get("attempts")
+    if not isinstance(attempts, dict):
+        return 0
+    task_entry = attempts.get(task_type)
+    if not isinstance(task_entry, dict):
+        return 0
+    return int(task_entry.get("count", 0))
+
+
+def should_escalate(
+    project_config: object,
+    agent_state: dict[str, object],
+    task_type: str,
+) -> bool:
+    """Return True if the attempt count has reached the escalation threshold.
+
+    Requires project_config to have a retry_policy attribute (ProjectConfig).
+    Falls back gracefully if the attribute is missing.
+    """
+    from cascade.config import ProjectConfig  # avoid circular at module top
+
+    if not isinstance(project_config, ProjectConfig):
+        return False
+
+    attempts = agent_state.get("attempts")
+    if not isinstance(attempts, dict):
+        return False
+    task_entry = attempts.get(task_type)
+    if not isinstance(task_entry, dict):
+        return False
+
+    count = int(task_entry.get("count", 0))
+    last_profile = str(task_entry.get("last_profile") or "")
+    threshold = project_config.retry_policy.max_attempts_for_profile(last_profile)
+    return count >= threshold

@@ -1,0 +1,22 @@
+services:
+  cascade:
+    build: .
+    working_dir: /workspace/cascade
+    volumes:
+      - ..:/workspace
+      - ~/.ssh:/root/.ssh:ro
+      - ~/.gitconfig:/root/.gitconfig:ro
+      - opencode-data:/root/.local/share/opencode
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    stdin_open: true
+    tty: true
+
+volumes:
+  opencode-data:

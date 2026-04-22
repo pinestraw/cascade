@@ -25,16 +25,139 @@ commands:
 branches:
   agent_branch_template: "agent/{agent}/{slug}"
 
+# ---------------------------------------------------------------------------
+# Model profiles
+# Costs are estimates in USD per million tokens.
+# Verify current pricing at https://openrouter.ai/models before relying on
+# these numbers for budget decisions.
+# ---------------------------------------------------------------------------
 models:
   default:
     provider: openrouter
     model: z-ai/glm-4.7
+    input_cost_per_million: 0.38
+    output_cost_per_million: 1.74
   cheap:
     provider: openrouter
     model: z-ai/glm-4.7-flash
+    input_cost_per_million: 0.06
+    output_cost_per_million: 0.40
   strong:
     provider: openrouter
     model: anthropic/claude-sonnet-4.5
+    input_cost_per_million: 3.00
+    output_cost_per_million: 15.00
   local:
     provider: local
     model: qwen-coder
+    input_cost_per_million: 0.0
+    output_cost_per_million: 0.0
+
+  profiles:
+    cheap_planner:
+      provider: openrouter
+      model: z-ai/glm-4.7-flash
+      input_cost_per_million: 0.06
+      output_cost_per_million: 0.40
+      use_for:
+        - plan
+        - clarify
+        - summarize
+
+    cheap_coder:
+      provider: openrouter
+      model: qwen/qwen3-coder-30b-a3b-instruct
+      input_cost_per_million: 0.07
+      output_cost_per_million: 0.27
+      use_for:
+        - implement_simple
+        - fix_simple
+
+    executor:
+      provider: openrouter
+      model: z-ai/glm-4.7
+      input_cost_per_million: 0.38
+      output_cost_per_million: 1.74
+      use_for:
+        - implement
+        - implement_complex
+
+    debugger:
+      provider: openrouter
+      model: deepseek/deepseek-v3.2
+      input_cost_per_million: 0.25
+      output_cost_per_million: 0.40
+      use_for:
+        - diagnose
+        - debug
+        - review
+
+    reviewer:
+      provider: openrouter
+      model: deepseek/deepseek-v3.2
+      input_cost_per_million: 0.25
+      output_cost_per_million: 0.40
+      use_for:
+        - review
+
+# ---------------------------------------------------------------------------
+# Context budgets: bounds on context pack size per task type.
+# max_input_tokens is a rough estimate — Cascade uses len(text)//4 to gauge.
+# ---------------------------------------------------------------------------
+context_budgets:
+  plan:
+    max_input_tokens: 50000
+    include_full_diff: false
+    include_diff_stat: true
+    include_logs_tail_lines: 150
+    include_instruction_files: true
+    include_full_transcript: false
+
+  implement:
+    max_input_tokens: 120000
+    include_full_diff: false
+    include_diff_stat: true
+    include_logs_tail_lines: 150
+    include_instruction_files: true
+    include_full_transcript: false
+
+  diagnose:
+    max_input_tokens: 60000
+    include_full_diff: false
+    include_diff_stat: true
+    include_logs_tail_lines: 300
+    include_instruction_files: false
+    include_full_transcript: false
+
+  fix:
+    max_input_tokens: 80000
+    include_full_diff: false
+    include_diff_stat: true
+    include_logs_tail_lines: 300
+    include_instruction_files: false
+    include_full_transcript: false
+
+  review:
+    max_input_tokens: 100000
+    include_full_diff: false
+    include_diff_stat: true
+    include_logs_tail_lines: 200
+    include_instruction_files: true
+    include_full_transcript: false
+
+  summarize:
+    max_input_tokens: 40000
+    include_full_diff: false
+    include_diff_stat: true
+    include_logs_tail_lines: 100
+    include_instruction_files: false
+    include_full_transcript: false
+
+# ---------------------------------------------------------------------------
+# Retry policy: max model attempts before requiring human intervention.
+# ---------------------------------------------------------------------------
+retry_policy:
+  cheap_coder_max_attempts: 2
+  executor_max_attempts: 2
+  debugger_max_attempts: 1
+  same_gate_failure_escalation_after: 2

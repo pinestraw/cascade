@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, model_validator
@@ -33,9 +34,31 @@ class BranchesConfig(BaseModel):
     agent_branch_template: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Model profiles (extended)
+# ---------------------------------------------------------------------------
+
+TaskType = Literal[
+    "plan",
+    "clarify",
+    "summarize",
+    "implement",
+    "implement_simple",
+    "implement_complex",
+    "fix",
+    "fix_simple",
+    "diagnose",
+    "debug",
+    "review",
+]
+
+
 class ModelProfile(BaseModel):
     provider: str
     model: str
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
+    use_for: list[str] = Field(default_factory=list)
 
 
 class ModelsConfig(BaseModel):
@@ -43,6 +66,72 @@ class ModelsConfig(BaseModel):
     cheap: ModelProfile | None = None
     strong: ModelProfile | None = None
     local: ModelProfile | None = None
+    # Named model profiles keyed by profile name (e.g. cheap_planner, executor)
+    profiles: dict[str, ModelProfile] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Context budgets
+# ---------------------------------------------------------------------------
+
+
+class ContextBudget(BaseModel):
+    max_input_tokens: int = 80000
+    include_full_diff: bool = False
+    include_diff_stat: bool = True
+    include_logs_tail_lines: int = 150
+    include_instruction_files: bool = True
+    include_full_transcript: bool = False
+
+
+_DEFAULT_BUDGETS: dict[str, ContextBudget] = {
+    "plan": ContextBudget(max_input_tokens=50000, include_logs_tail_lines=150, include_instruction_files=True),
+    "implement": ContextBudget(max_input_tokens=120000, include_logs_tail_lines=150, include_instruction_files=True),
+    "diagnose": ContextBudget(max_input_tokens=60000, include_logs_tail_lines=300, include_instruction_files=False),
+    "fix": ContextBudget(max_input_tokens=80000, include_logs_tail_lines=300, include_instruction_files=False),
+    "review": ContextBudget(max_input_tokens=100000, include_logs_tail_lines=200, include_instruction_files=True),
+    "summarize": ContextBudget(max_input_tokens=40000, include_logs_tail_lines=100, include_instruction_files=False),
+}
+
+
+class ContextBudgetsConfig(BaseModel):
+    plan: ContextBudget = Field(default_factory=lambda: _DEFAULT_BUDGETS["plan"])
+    implement: ContextBudget = Field(default_factory=lambda: _DEFAULT_BUDGETS["implement"])
+    diagnose: ContextBudget = Field(default_factory=lambda: _DEFAULT_BUDGETS["diagnose"])
+    fix: ContextBudget = Field(default_factory=lambda: _DEFAULT_BUDGETS["fix"])
+    review: ContextBudget = Field(default_factory=lambda: _DEFAULT_BUDGETS["review"])
+    summarize: ContextBudget = Field(default_factory=lambda: _DEFAULT_BUDGETS["summarize"])
+
+    def for_task(self, task_type: str) -> ContextBudget:
+        budget = getattr(self, task_type, None)
+        if isinstance(budget, ContextBudget):
+            return budget
+        return _DEFAULT_BUDGETS.get(task_type, ContextBudget())
+
+
+# ---------------------------------------------------------------------------
+# Retry policy
+# ---------------------------------------------------------------------------
+
+
+class RetryPolicyConfig(BaseModel):
+    cheap_coder_max_attempts: int = 2
+    executor_max_attempts: int = 2
+    debugger_max_attempts: int = 1
+    same_gate_failure_escalation_after: int = 2
+
+    def max_attempts_for_profile(self, profile_name: str) -> int:
+        mapping: dict[str, int] = {
+            "cheap_coder": self.cheap_coder_max_attempts,
+            "executor": self.executor_max_attempts,
+            "debugger": self.debugger_max_attempts,
+        }
+        return mapping.get(profile_name, 1)
+
+
+# ---------------------------------------------------------------------------
+# Project config
+# ---------------------------------------------------------------------------
 
 
 class ProjectConfig(BaseModel):
@@ -53,6 +142,8 @@ class ProjectConfig(BaseModel):
     commands: CommandsConfig
     branches: BranchesConfig = Field(default_factory=BranchesConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
+    context_budgets: ContextBudgetsConfig = Field(default_factory=ContextBudgetsConfig)
+    retry_policy: RetryPolicyConfig = Field(default_factory=RetryPolicyConfig)
 
     @model_validator(mode="after")
     def validate_required_fields(self) -> "ProjectConfig":
@@ -82,9 +173,6 @@ def load_project_config(project_file: Path) -> ProjectConfig:
 
 
 def resolve_project_paths(project: ProjectConfig) -> ProjectConfig:
-    # MVP behavior: resolve configured paths relative to the current working
-    # directory so `examples/jungle.yaml` can use sibling repo paths like
-    # `../jungle` when the user runs `cascade` from the cascade repo root.
     project.paths.repo_root = project.paths.repo_root.resolve()
     project.paths.worktree_root = project.paths.worktree_root.resolve()
     if project.paths.secrets_root is not None:
@@ -104,3 +192,46 @@ def instruction_file_paths(project: ProjectConfig) -> list[Path]:
         else:
             resolved_paths.append(direct_path)
     return resolved_paths
+
+
+# ---------------------------------------------------------------------------
+# Model profile helpers
+# ---------------------------------------------------------------------------
+
+
+def get_model_profile(project: ProjectConfig, profile_name: str) -> ModelProfile:
+    """Return the named model profile, or raise ConfigError if not found."""
+    profile = project.models.profiles.get(profile_name)
+    if profile is not None:
+        return profile
+    # Fall back to legacy slots
+    legacy = getattr(project.models, profile_name, None)
+    if isinstance(legacy, ModelProfile):
+        return legacy
+    raise ConfigError(
+        f"Model profile '{profile_name}' not found in project config. "
+        f"Available profiles: {list(project.models.profiles.keys())}"
+    )
+
+
+def resolve_model_for_task(project: ProjectConfig, task_type: str) -> ModelProfile | None:
+    """Find the first named profile whose use_for list covers task_type.
+
+    Returns None if no profile matches; callers should fall back to the default.
+    """
+    for profile in project.models.profiles.values():
+        if task_type in profile.use_for:
+            return profile
+    return None
+
+
+def model_id_for_opencode(profile: ModelProfile) -> str:
+    """Return the OpenCode/OpenRouter model string for a profile.
+
+    For OpenRouter profiles this produces 'openrouter/<provider>/<model>'.
+    For others it returns '<provider>/<model>' verbatim.
+    """
+    provider = profile.provider.lower()
+    if provider == "openrouter":
+        return f"openrouter/{profile.model}"
+    return f"{provider}/{profile.model}"
