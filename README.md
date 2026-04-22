@@ -72,29 +72,98 @@ pip install -e .
 Docker is the preferred reproducible workflow.  The container includes Python,
 Node.js, OpenCode (`opencode-ai`), the GitHub CLI (`gh`), and Cascade itself.
 
-### Expected folder layout
+## Dedicated workspace layout
+
+Cascade is designed to run from a dedicated workspace folder that contains only
+the repos for a single project family.  This keeps Docker mounts scoped and
+prevents accidental edits to unrelated sibling repos.
+
+### Recommended layout
 
 ```text
-parent/
-  cascade/           ← this repo
+instica-workspace/
+  cascade/              ← run Cascade from here
   jungle/
   jungle-worktrees/
   jungle-secrets/
+  jungle-infrastructure/
+  instica.code-workspace
 ```
 
-The Compose volume mounts `..:/workspace` so all sibling repos are visible
-inside the container at `/workspace/<repo-name>`.  Paths like `../jungle` in
-`examples/jungle.yaml` resolve correctly inside the container.
+### Why a dedicated workspace?
+
+- `docker-compose.yml` mounts `..:/workspace`, so `..` must be the workspace
+  root, not a broad folder like `~/Documents` or `~/github-projects`.
+- `examples/jungle.yaml` sets `workspace_root: ".."` so all project paths
+  resolve relative to the workspace root rather than using `../jungle` etc.
+- Cascade only operates on paths explicitly declared in the project YAML.
+  Sibling repos that are not declared will never be touched.
+
+### Project YAML: new-style paths
+
+```yaml
+paths:
+  workspace_root: ".."     # resolved relative to CWD (cascade/)
+  repo_root: "jungle"      # resolved relative to workspace_root
+  worktree_root: "jungle-worktrees"
+  secrets_root: "jungle-secrets"
+
+related_repos:
+  infrastructure: "jungle-infrastructure"
+```
+
+Expected resolved paths when running from `instica-workspace/cascade`:
+
+```
+workspace_root  => instica-workspace
+repo_root       => instica-workspace/jungle
+worktree_root   => instica-workspace/jungle-worktrees
+secrets_root    => instica-workspace/jungle-secrets
+related_repos.infrastructure => instica-workspace/jungle-infrastructure
+```
+
+Inside Docker the same paths resolve to `/workspace`, `/workspace/jungle`, etc.
+
+### Workspace safety rules enforced by Cascade
+
+- `repo_root`, `worktree_root`, `secrets_root`, and all `related_repos` must
+  resolve inside `workspace_root` — escape paths (`../../`) are rejected.
+- Model prompts include: *"Only operate inside the assigned worktree and
+  explicitly declared project paths. Do not inspect or edit unrelated sibling
+  repositories in the workspace."*
+- A broad `workspace_root` (e.g. `github-projects`, `Documents`, home
+  directory) triggers a `warn` in `cascade doctor`.
+
+### VS Code workspace file
+
+Include only repos that are part of the active project:
+
+```json
+{
+  "folders": [
+    { "path": "cascade" },
+    { "path": "jungle" },
+    { "path": "jungle-worktrees" },
+    { "path": "jungle-secrets" },
+    { "path": "jungle-infrastructure" }
+  ]
+}
+```
 
 ### First-time setup
 
 ```bash
+cd ~/Documents/instica-workspace/cascade
 cp .env.example .env
 # Add OPENROUTER_API_KEY (and GITHUB_TOKEN) to .env
 
 make build
 make shell        # opens bash inside the container
-cascade --help
+
+# Inside the shell:
+pwd               # /workspace/cascade
+ls /workspace     # cascade  jungle  jungle-worktrees  jungle-secrets  jungle-infrastructure
+cascade doctor --project-file examples/jungle.yaml
 opencode --version
 ```
 
@@ -161,11 +230,15 @@ make prepare  AGENT=oc1 PROJECT=jungle TASK=implement PROFILE=executor
 ### Run OpenCode interactively in a worktree
 
 ```bash
+# Preferred: workspace-relative PATH (no leading ../)
+make opencode PATH=jungle-worktrees/oc1-daily-digest-email MODEL=openrouter/z-ai/glm-4.7
+
+# Legacy: WORKTREE= still works for backward compat
 make opencode WORKTREE=../jungle-worktrees/oc1-daily-digest-email MODEL=openrouter/z-ai/glm-4.7
 ```
 
-If `WORKTREE` is omitted a plain bash shell opens instead so you can run
-`opencode <path>` manually.
+If neither `PATH` nor `WORKTREE` is set, a plain bash shell opens so you can
+run `opencode <path>` manually.
 
 ### Limitations
 
@@ -173,9 +246,10 @@ If `WORKTREE` is omitted a plain bash shell opens instead so you can run
   of Cascade supports that flag before using it.
 - `~/.ssh` and `~/.gitconfig` are mounted read-only; adjust the volume entries
   in `docker-compose.yml` if your paths differ.
-- GitHub CLI interactive `gh auth login` works inside `make shell` but auth is
-  not persisted across containers unless you add a dedicated Docker volume for
-  `~/.config/gh`.
+- GitHub CLI auth persists across containers via the `gh-config` Docker volume
+  (`/root/.config/gh`).  Run `gh auth login` inside `make shell` once.
+- OpenCode auth persists via the `opencode-data` Docker volume.  Use `/connect`
+  inside `make shell` to authenticate interactively.
 
 ## Example usage
 

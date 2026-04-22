@@ -190,18 +190,24 @@ endif
 # ── OpenCode convenience target ────────────────────────────────────────────────
 # Run OpenCode interactively inside the cascade container.
 #
-# Usage (with target worktree and model):
+# Preferred usage (workspace-relative path, no leading ../):
+#   make opencode PATH=jungle-worktrees/oc1-slug MODEL=openrouter/z-ai/glm-4.7
+#
+# Legacy usage (still supported for backward compat):
 #   make opencode WORKTREE=../jungle-worktrees/oc1-slug MODEL=openrouter/z-ai/glm-4.7
 #
-# Without WORKTREE, opens a plain bash shell for manual use.
+# Without PATH or WORKTREE, prints usage and opens a plain bash shell.
 
 opencode:
-ifdef WORKTREE
+ifdef PATH
+	$(COMPOSE) run --rm --workdir /workspace/$(PATH) \
+		$(SVC) opencode . $(if $(MODEL),--model $(MODEL),)
+else ifdef WORKTREE
 	$(COMPOSE) run --rm --workdir /workspace/$(patsubst ../%,%,$(WORKTREE)) \
 		$(SVC) opencode . $(if $(MODEL),--model $(MODEL),)
 else
-	@echo "Usage: make opencode WORKTREE=<relative-path-to-worktree> [MODEL=<model-id>]"
-	@echo "Example: make opencode WORKTREE=../jungle-worktrees/oc1-daily-digest MODEL=openrouter/z-ai/glm-4.7"
+	@echo "Usage: make opencode PATH=<workspace-relative-path> [MODEL=<model-id>]"
+	@echo "Example: make opencode PATH=jungle-worktrees/oc1-daily-digest MODEL=openrouter/z-ai/glm-4.7"
 	@echo ""
 	@echo "Opening shell instead — run 'opencode <path>' manually."
 	$(COMPOSE) run --rm $(SVC) bash

@@ -5,10 +5,34 @@ github:
   repo: jungle
   project_name: Instica
 
+# ---------------------------------------------------------------------------
+# Workspace layout
+# ---------------------------------------------------------------------------
+# workspace_root is resolved relative to the working directory when Cascade is
+# run (e.g. instica-workspace/cascade).  All other paths are resolved relative
+# to workspace_root.
+#
+# Expected layout:
+#   instica-workspace/
+#     cascade/           ← run Cascade from here
+#     jungle/
+#     jungle-worktrees/
+#     jungle-secrets/
+#     jungle-infrastructure/
+#
+# Inside Docker: workspace_root resolves to /workspace (mounted via ..:/workspace)
+# ---------------------------------------------------------------------------
 paths:
-  repo_root: "../jungle"
-  worktree_root: "../jungle-worktrees"
-  secrets_root: "../jungle-secrets"
+  workspace_root: ".."
+  repo_root: "jungle"
+  worktree_root: "jungle-worktrees"
+  secrets_root: "jungle-secrets"
+
+# Explicitly declared related repos that Cascade may operate on.
+# Do not add repos here unless they are truly part of this project family.
+# Cascade will not scan or auto-discover other sibling repos.
+related_repos:
+  infrastructure: "jungle-infrastructure"
 
 instructions:
   files:

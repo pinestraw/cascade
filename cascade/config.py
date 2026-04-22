@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -14,6 +15,7 @@ class GithubConfig(BaseModel):
 
 
 class PathsConfig(BaseModel):
+    workspace_root: Path | None = None
     repo_root: Path
     worktree_root: Path
     secrets_root: Path | None = None
@@ -138,6 +140,7 @@ class ProjectConfig(BaseModel):
     name: str
     github: GithubConfig
     paths: PathsConfig
+    related_repos: dict[str, Path] = Field(default_factory=dict)
     instructions: InstructionsConfig = Field(default_factory=InstructionsConfig)
     commands: CommandsConfig
     branches: BranchesConfig = Field(default_factory=BranchesConfig)
@@ -154,6 +157,125 @@ class ProjectConfig(BaseModel):
 
 class ConfigError(Exception):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Workspace validation helpers
+# ---------------------------------------------------------------------------
+
+# Directory names that suggest an overly broad workspace_root.
+_BROAD_WORKSPACE_NAMES = frozenset({
+    "github-projects",
+    "documents",
+    "desktop",
+    "projects",
+    "code",
+    "dev",
+    "src",
+    "workspace",
+})
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    """Result of a single path validation check."""
+
+    key: str
+    path: Path
+    status: str  # "ok" | "warn" | "fail"
+    message: str
+
+
+def resolve_workspace_root(project: "ProjectConfig") -> Path | None:
+    """Return the resolved workspace_root, or None if not configured."""
+    if project.paths.workspace_root is None:
+        return None
+    return project.paths.workspace_root.resolve()
+
+
+def is_inside_workspace(path: Path, workspace_root: Path) -> bool:
+    """Return True if *path* is inside (or equal to) *workspace_root*."""
+    try:
+        path.resolve().relative_to(workspace_root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def workspace_root_is_broad(workspace_root: Path) -> bool:
+    """Heuristic: return True if the workspace_root looks overly broad."""
+    home = Path.home()
+    resolved = workspace_root.resolve()
+    if resolved == home:
+        return True
+    name_lower = resolved.name.lower()
+    return name_lower in _BROAD_WORKSPACE_NAMES
+
+
+def validate_project_paths(project: "ProjectConfig") -> list[ValidationResult]:
+    """Validate all configured paths against the workspace boundary.
+
+    Returns a list of ValidationResult items (ok/warn/fail) for every path.
+    """
+    results: list[ValidationResult] = []
+    workspace = resolve_workspace_root(project)
+
+    if workspace is not None:
+        exists = workspace.exists()
+        results.append(ValidationResult(
+            key="workspace_root",
+            path=workspace,
+            status="ok" if exists else "fail",
+            message=str(workspace) if exists else f"workspace_root does not exist: {workspace}",
+        ))
+
+        if workspace_root_is_broad(workspace):
+            results.append(ValidationResult(
+                key="workspace_root_broad",
+                path=workspace,
+                status="warn",
+                message=(
+                    f"workspace_root appears broad ({workspace.name!r}); "
+                    "prefer a dedicated workspace such as 'instica-workspace'."
+                ),
+            ))
+
+    def _check(key: str, path: Path, *, required: bool) -> None:
+        exists = path.exists()
+        inside = workspace is None or is_inside_workspace(path, workspace)
+        if not inside:
+            results.append(ValidationResult(
+                key=key,
+                path=path,
+                status="fail",
+                message=f"{key} ({path}) is outside workspace_root ({workspace}). Escape paths are not allowed.",
+            ))
+            return
+        if not exists:
+            status = "fail" if required else "warn"
+            results.append(ValidationResult(
+                key=key,
+                path=path,
+                status=status,
+                message=f"{key} does not exist: {path}",
+            ))
+            return
+        results.append(ValidationResult(
+            key=key,
+            path=path,
+            status="ok",
+            message=str(path),
+        ))
+
+    _check("repo_root", project.paths.repo_root, required=True)
+    _check("worktree_root", project.paths.worktree_root, required=False)
+    if project.paths.secrets_root is not None:
+        _check("secrets_root", project.paths.secrets_root, required=False)
+
+    for name, related_path in project.related_repos.items():
+        _check(f"related_repos.{name}", related_path, required=False)
+
+    return results
 
 
 def load_project_config(project_file: Path) -> ProjectConfig:
@@ -173,10 +295,37 @@ def load_project_config(project_file: Path) -> ProjectConfig:
 
 
 def resolve_project_paths(project: ProjectConfig) -> ProjectConfig:
-    project.paths.repo_root = project.paths.repo_root.resolve()
-    project.paths.worktree_root = project.paths.worktree_root.resolve()
-    if project.paths.secrets_root is not None:
-        project.paths.secrets_root = project.paths.secrets_root.resolve()
+    """Resolve all paths in the project config.
+
+    When workspace_root is configured:
+      - workspace_root is resolved relative to CWD.
+      - repo_root, worktree_root, secrets_root, and related_repos values are
+        resolved relative to workspace_root (not CWD).
+
+    When workspace_root is absent (legacy configs):
+      - All paths are resolved relative to CWD as before.
+    """
+    workspace_root = project.paths.workspace_root
+    if workspace_root is not None:
+        resolved_ws = workspace_root.resolve()
+        project.paths.workspace_root = resolved_ws
+        project.paths.repo_root = (resolved_ws / project.paths.repo_root).resolve()
+        project.paths.worktree_root = (resolved_ws / project.paths.worktree_root).resolve()
+        if project.paths.secrets_root is not None:
+            project.paths.secrets_root = (resolved_ws / project.paths.secrets_root).resolve()
+        project.related_repos = {
+            name: (resolved_ws / rel_path).resolve()
+            for name, rel_path in project.related_repos.items()
+        }
+    else:
+        project.paths.repo_root = project.paths.repo_root.resolve()
+        project.paths.worktree_root = project.paths.worktree_root.resolve()
+        if project.paths.secrets_root is not None:
+            project.paths.secrets_root = project.paths.secrets_root.resolve()
+        project.related_repos = {
+            name: rel_path.resolve()
+            for name, rel_path in project.related_repos.items()
+        }
     return project
 
 

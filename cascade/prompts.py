@@ -2,7 +2,32 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from cascade.config import ProjectConfig
+from cascade.config import ProjectConfig, resolve_workspace_root
+
+
+def _workspace_boundary_block(project: ProjectConfig) -> str:
+    """Build the workspace boundary section for model prompts."""
+    workspace = resolve_workspace_root(project)
+    if workspace is None:
+        return ""
+    lines = [
+        "# Workspace boundary",
+        "",
+        f"- workspace_root: {workspace}",
+        f"- repo_root: {project.paths.repo_root}",
+        f"- worktree_root: {project.paths.worktree_root}",
+    ]
+    if project.paths.secrets_root is not None:
+        lines.append(f"- secrets_root: {project.paths.secrets_root}")
+    for name, rpath in project.related_repos.items():
+        lines.append(f"- related_repos.{name}: {rpath}")
+    lines += [
+        "",
+        "Only operate inside the assigned worktree and explicitly declared project paths.",
+        "Do not inspect or edit unrelated sibling repositories in the workspace.",
+        "",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def build_launch_prompt(
@@ -14,6 +39,8 @@ def build_launch_prompt(
     instruction_lines = "\n".join(f"- {path}" for path in instruction_files)
     if not instruction_lines:
         instruction_lines = "- No configured instruction files"
+
+    workspace_block = _workspace_boundary_block(project)
 
     return f"""You are Cascade Agent `{agent_state['agent']}` working on project `{project.name}`.
 
@@ -33,10 +60,11 @@ Before editing files, read and obey these files if present:
 
 {instruction_lines}
 
-# Operating rules
+{workspace_block}# Operating rules
 
 - Work only inside the assigned worktree.
 - Do not modify unrelated worktrees.
+- Do not inspect or edit unrelated sibling repositories in the workspace.
 - Use the project's configured commands.
 - Prefer repo Make targets over ad-hoc commands.
 - Do not run destructive cleanup or removal commands unless explicitly told.

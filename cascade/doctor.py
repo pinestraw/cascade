@@ -6,7 +6,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from cascade.config import ConfigError, load_project_config
+from cascade.config import (
+    ConfigError,
+    ValidationResult,
+    is_inside_workspace,
+    load_project_config,
+    resolve_workspace_root,
+    validate_project_paths,
+    workspace_root_is_broad,
+)
 
 
 @dataclass(frozen=True)
@@ -69,20 +77,35 @@ def run_doctor_checks(project_file: Path) -> list[DoctorCheck]:
         )
     )
 
-    checks.append(
-        DoctorCheck(
-            name="repo_root",
-            status="ok" if project.paths.repo_root.exists() else "fail",
-            details=str(project.paths.repo_root),
+    # ── Workspace path checks ────────────────────────────────────────────────
+    workspace = resolve_workspace_root(project)
+    if workspace is not None:
+        checks.append(
+            DoctorCheck(
+                name="workspace_root",
+                status="ok" if workspace.exists() else "fail",
+                details=str(workspace),
+            )
         )
-    )
-    checks.append(
-        DoctorCheck(
-            name="worktree_root",
-            status="ok" if project.paths.worktree_root.exists() else "warn",
-            details=str(project.paths.worktree_root),
-        )
-    )
+        if workspace_root_is_broad(workspace):
+            checks.append(
+                DoctorCheck(
+                    name="workspace_root_broad",
+                    status="warn",
+                    details=(
+                        f"workspace_root appears broad ({workspace.name!r}); "
+                        "prefer a dedicated workspace such as 'instica-workspace'."
+                    ),
+                )
+            )
+
+    path_results: list[ValidationResult] = validate_project_paths(project)
+    # Skip workspace_root itself (already added above) and broad warning
+    skip_keys = {"workspace_root", "workspace_root_broad"}
+    for result in path_results:
+        if result.key in skip_keys:
+            continue
+        checks.append(DoctorCheck(name=result.key, status=result.status, details=result.message))
 
     if gh_path is None:
         checks.append(

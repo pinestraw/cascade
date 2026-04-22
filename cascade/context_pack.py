@@ -16,7 +16,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from cascade.config import ProjectConfig, instruction_file_paths
+from cascade.config import ProjectConfig, instruction_file_paths, resolve_workspace_root
 from cascade.costs import estimate_tokens
 from cascade.gates import load_gate_result, check_gate_staleness, gate_status_line
 from cascade.standards import (
@@ -97,9 +97,22 @@ class ContextPack:
     body: str  # The full assembled markdown text
 
 
-def _operating_rules_block() -> str:
-    return """## Operating safety rules (always included)
+def _operating_rules_block(
+    workspace_root: str | None = None,
+    allowed_paths: list[str] | None = None,
+) -> str:
+    workspace_section = ""
+    if workspace_root:
+        workspace_section = f"- Workspace boundary: {workspace_root}\n"
+    if allowed_paths:
+        paths_list = "\n".join(f"  - {p}" for p in allowed_paths)
+        workspace_section += f"- Allowed project paths:\n{paths_list}\n"
 
+    return (
+        """## Operating safety rules (always included)
+
+- Only operate inside the assigned worktree and explicitly declared project paths.
+- Do not inspect or edit unrelated sibling repositories in the workspace.
 - Work only in the assigned worktree.
 - Do not weaken gates, tests, coverage, typing, pre-commit, pre-push, or enforcement code.
 - Do not stage, commit, or push unless explicitly authorized.
@@ -107,6 +120,8 @@ def _operating_rules_block() -> str:
 - If fixing, address only the specified failure; avoid unrelated refactors.
 - Secrets are not included in this context pack.
 """
+        + workspace_section
+    )
 
 
 def build_context_pack(
@@ -169,6 +184,18 @@ def build_context_pack(
     if budget.include_instruction_files:
         instruction_names = [str(p) for p in instruction_file_paths(project)]
 
+    # Workspace boundary context for prompt
+    workspace_root_path = resolve_workspace_root(project)
+    workspace_root_str = str(workspace_root_path) if workspace_root_path else None
+    allowed_paths: list[str] = []
+    if workspace_root_str:
+        allowed_paths.append(f"repo_root: {project.paths.repo_root}")
+        allowed_paths.append(f"worktree_root: {project.paths.worktree_root}")
+        if project.paths.secrets_root is not None:
+            allowed_paths.append(f"secrets_root: {project.paths.secrets_root}")
+        for name, rpath in project.related_repos.items():
+            allowed_paths.append(f"related_repos.{name}: {rpath}")
+
     # Warnings
     warnings: list[str] = []
     secrets_root = project.paths.secrets_root
@@ -195,7 +222,7 @@ def build_context_pack(
     )
     included_sections.append("header")
 
-    sections.append(_operating_rules_block())
+    sections.append(_operating_rules_block(workspace_root=workspace_root_str, allowed_paths=allowed_paths or None))
     included_sections.append("operating_rules")
 
     # Gate result
@@ -303,6 +330,8 @@ def build_context_pack(
                     diff_md=diff_md,
                     preflight_log_tail=preflight_log_tail,
                     included_keys=set(remaining_sections),
+                    workspace_root_str=workspace_root_str,
+                    allowed_paths=allowed_paths or None,
                 )
 
         included_sections = remaining_sections
@@ -353,6 +382,8 @@ def _rebuild_body(
     diff_md: str,
     preflight_log_tail: str,
     included_keys: set[str],
+    workspace_root_str: str | None = None,
+    allowed_paths: list[str] | None = None,
 ) -> str:
     """Rebuild context pack body including only sections in included_keys."""
     worktree_str = str(agent_state.get("worktree", ""))
@@ -371,7 +402,7 @@ def _rebuild_body(
         f"- Worktree: {worktree_str}\n"
         f"- Branch: {current_branch}\n"
     )
-    sections.append(_operating_rules_block())
+    sections.append(_operating_rules_block(workspace_root=workspace_root_str, allowed_paths=allowed_paths))
 
     gate_section = f"## Gate Result\n\n- Status: {gate_line}\n"
     if gate_result:
