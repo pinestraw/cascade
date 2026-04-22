@@ -1,0 +1,40 @@
+name: jungle
+
+github:
+  owner: pinestraw
+  repo: jungle
+  project_name: Instica
+
+paths:
+  repo_root: "../jungle"
+  worktree_root: "../jungle-worktrees"
+  secrets_root: "../jungle-secrets"
+
+instructions:
+  files:
+    - "COPILOT.md"
+    - "copilot-instructions.md"
+    - "AGENT_MANDATE_PROTOCOL.md"
+
+commands:
+  create_worktree: "make agent-worktree-create agent={agent} slug={slug}"
+  preflight: "make mandate-preflight MANDATE_SLUG={slug}"
+  done: "make mandate-done MANDATE_SLUG={slug}"
+  status: "git status --short"
+
+branches:
+  agent_branch_template: "agent/{agent}/{slug}"
+
+models:
+  default:
+    provider: openrouter
+    model: z-ai/glm-4.7
+  cheap:
+    provider: openrouter
+    model: z-ai/glm-4.7-flash
+  strong:
+    provider: openrouter
+    model: anthropic/claude-sonnet-4.5
+  local:
+    provider: local
+    model: qwen-coder
