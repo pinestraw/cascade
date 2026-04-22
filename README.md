@@ -40,8 +40,8 @@ Cascade intentionally keeps most steps deterministic. Model calls are reserved f
 
 1. Claim a GitHub issue for an agent with `cascade claim`.
 2. Cascade fetches the issue body, derives a slug, runs the configured worktree command, and writes local state.
-3. Review the generated launch prompt with `cascade show-prompt`.
-4. Start the agent session with `cascade run-agent`.
+3. Start the agent session with `cascade run-agent`.
+4. Cascade launches OpenCode in the assigned worktree and loads the generated prompt automatically when available.
 5. Track progress with `cascade status` and `cascade mark`.
 
 ## Requirements
@@ -58,7 +58,19 @@ Your active dev shell must be running Python 3.11+ before creating the virtualen
 
 ```bash
 cp .env.example .env   # fill in API keys
-make build             # build the Docker image once
+make build             # prepare SSH + wrapper, then build the Docker image
+```
+
+`make build` now performs standard host/Docker setup:
+
+- prepares Docker-safe SSH config (`make ssh-config`)
+- installs/updates the host `cascade` wrapper (`make install-wrapper`)
+- builds the Docker image (`make docker-build`)
+
+If you need image build only (no host setup changes), use:
+
+```bash
+make docker-build
 ```
 
 For running Cascade locally (outside Docker), you still need a 3.11+ Python and can install with:
@@ -70,7 +82,77 @@ pip install -e .
 ## Running with Docker Compose
 
 Docker is the preferred reproducible workflow.  The container includes Python,
-Node.js, OpenCode (`opencode-ai`), the GitHub CLI (`gh`), and Cascade itself.
+Node.js, OpenCode (`opencode-ai`), the GitHub CLI (`gh`), the Docker CLI with
+the Compose plugin, and Cascade itself.
+
+Cascade uses the host Docker daemon through the mounted host socket at
+`/var/run/docker.sock`. It does not run privileged Docker-in-Docker and does
+not start a nested Docker daemon.
+
+## Host `cascade` wrapper (Docker-backed)
+
+You can install a host-side `cascade` wrapper so commands run in Docker Compose
+without typing `make cascade ARGS=...`.
+
+Install:
+
+```bash
+make install-wrapper
+make wrapper-check
+```
+
+Then use from your host shell:
+
+```bash
+cascade status --project jungle
+cascade claim --project-file examples/jungle.yaml --issue 44 --agent a1 --engine opencode --model openrouter/z-ai/glm-4.7
+cascade run-agent a1 --project jungle
+```
+
+Notes:
+
+- The wrapper is installed by default at `~/.local/bin/cascade`.
+- It runs `docker compose run --rm cascade cascade "$@"` from the Cascade repo root.
+- Interactive commands (`run-agent`, `chat`) preserve TTY behavior.
+- Docker-backed target repo commands run against the host Docker daemon through `/var/run/docker.sock`.
+- Customize install path with `make install-wrapper WRAPPER_BIN=/custom/path/cascade`.
+- If an existing non-Cascade wrapper is present, install/build fails safely.
+- Override that guard with `make install-wrapper FORCE=1` or `make build FORCE=1`.
+- Verify installation with `make wrapper-check`.
+
+## Docker SSH setup for private repos
+
+Cascade often runs inside Docker while operating on sibling private repositories
+mounted from the host workspace. Host SSH keys are mounted read-only, but macOS
+SSH configs often include `UseKeychain yes`, which Linux OpenSSH rejects.
+
+Cascade provides a Docker-safe SSH config flow:
+
+- source: `~/.ssh/config`
+- generated destination: `~/.cascade/ssh/config`
+- container mount override: `/root/.ssh/config`
+
+Run this before `make shell` if your target repos use SSH remotes:
+
+```bash
+make ssh-config
+make build
+make shell
+ssh -T git@github.com
+```
+
+Validation helpers:
+
+```bash
+make ssh-check
+make ssh-check REPO=/workspace/jungle BRANCH=staging
+```
+
+Notes:
+
+- `make ssh-config` never copies private keys into the repo or Docker image.
+- It sanitizes only the Docker-specific config file at `~/.cascade/ssh/config`.
+- Keep `~/.ssh` as your host source of truth.
 
 ## Dedicated workspace layout
 
@@ -155,7 +237,7 @@ Include only repos that are part of the active project:
 ```bash
 cd ~/Documents/instica-workspace/cascade
 cp .env.example .env
-# Add OPENROUTER_API_KEY (and GITHUB_TOKEN) to .env
+# Add OPENROUTER_API_KEY, GH_TOKEN, and GITHUB_TOKEN to .env
 
 make build
 make shell        # opens bash inside the container
@@ -173,14 +255,17 @@ opencode --version
 
 ```ini
 OPENROUTER_API_KEY=sk-or-...
+GH_TOKEN=ghp_...
 GITHUB_TOKEN=ghp_...
 ```
+
+Set both `GH_TOKEN` and `GITHUB_TOKEN` in `.env` for GitHub CLI compatibility inside Docker.
 
 **Option B**: run `make shell`, then inside the container run `opencode` and
 use `/connect` to authenticate interactively.  Auth persists in the
 `opencode-data` Docker volume.
 
-**GitHub CLI**: either set `GITHUB_TOKEN` in `.env`, or run `gh auth login`
+**GitHub CLI**: either set both `GH_TOKEN` and `GITHUB_TOKEN` in `.env`, or run `gh auth login`
 inside `make shell`.
 
 ### Run tests
@@ -196,6 +281,7 @@ make test-fast      # stop at first failure
 ```bash
 make doctor
 make capabilities
+make env-check
 ```
 
 ### Generic command wrapper
@@ -212,15 +298,17 @@ make cascade ARGS="doctor --project-file examples/jungle.yaml"
 make start ISSUE=45 AGENT=oc1 PROJECT_FILE=examples/jungle.yaml PROFILE=executor
 make check AGENT=oc1 PROJECT=jungle
 make fix   AGENT=oc1 PROJECT=jungle PROFILE=debugger
+make next  AGENT=oc1 PROJECT=jungle
 make check AGENT=oc1 PROJECT=jungle
 make finish AGENT=oc1 PROJECT=jungle          # dry-run (safe preview)
-make finish AGENT=oc1 PROJECT=jungle YES=1    # actually close out
+make finish AGENT=oc1 PROJECT=jungle YES=1    # mark closeout_ready
 ```
 
 ### Other workflow targets
 
 ```bash
 make status  PROJECT=jungle
+make next    AGENT=oc1 PROJECT=jungle
 make logs    AGENT=oc1 PROJECT=jungle KIND=preflight
 make context AGENT=oc1 PROJECT=jungle TASK=implement
 make estimate AGENT=oc1 PROJECT=jungle TASK=implement PROFILE=executor OUT=30000
@@ -242,8 +330,7 @@ run `opencode <path>` manually.
 
 ### Limitations
 
-- `make finish YES=1` passes `--yes` to `cascade finish`; verify your version
-  of Cascade supports that flag before using it.
+- `make finish YES=1` marks the agent `closeout_ready` after deterministic safety checks pass.
 - `~/.ssh` and `~/.gitconfig` are mounted read-only; adjust the volume entries
   in `docker-compose.yml` if your paths differ.
 - GitHub CLI auth persists across containers via the `gh-config` Docker volume
@@ -485,9 +572,20 @@ See `examples/jungle.yaml` for a complete working example.
 
 ### `run-agent`
 
-Loads saved state and launches `opencode . --model <model>` in the assigned worktree.
+Loads saved state and launches `opencode . --model <model>` in the assigned worktree with the selected prompt loaded automatically.
 
-On macOS it also prints a `pbcopy` command for the generated prompt, and `--print-prompt` will print the prompt before launching OpenCode.
+Defaults to `launch_prompt.md`, but you can override prompt selection with:
+
+- `--task <task>` to use `<task>_prompt.md`
+- `--prompt-file <path>` to use a specific file
+- `--no-prompt` to launch OpenCode without injecting a prompt
+- `--non-interactive` to run the prompt through `opencode run`
+
+Use `--print-prompt` to print the prompt before launching. For host clipboard fallback, you can always run:
+
+```bash
+cascade show-prompt oc1 --project jungle | pbcopy
+```
 
 ### `chat`
 
@@ -510,7 +608,7 @@ Requests a bounded summary using mandate, git status, recent transcript, and dec
 
 ### `continue`
 
-Builds `continue_prompt.md` from the capsule and launches OpenCode interactively. Use `--print-prompt` to print it before launching.
+Builds `continue_prompt.md` from the capsule and launches OpenCode with that continuation prompt loaded automatically. Use `--print-prompt` to print it before launching.
 
 ### `status`
 
@@ -518,7 +616,7 @@ Shows all claimed agents for a project in a Rich table.
 
 ### `show-prompt`
 
-Prints the generated launch prompt for easy copy/paste.
+Prints the generated launch prompt for easy copy/paste. You can also pass `--task <task>` or `--prompt-file <path>`.
 
 ### `mark`
 
@@ -540,9 +638,17 @@ Allowed states:
 
 Checks Python, required CLIs, GitHub auth, and the configured project paths without modifying files.
 
+When Cascade is running in Docker, `doctor` also checks that host-Docker access is available by verifying:
+
+- the Docker CLI exists inside the Cascade container
+- `/var/run/docker.sock` is mounted and readable
+- `docker info` can reach the host Docker daemon
+
 ### `preflight`
 
 Runs the configured preflight command in the assigned worktree, saves output to `preflight.log`, and updates the saved agent state.
+
+For Docker-backed target repos, preflight runs through the host Docker daemon mounted into the Cascade container. This keeps commands like `make mandate-preflight` and `docker compose` working from `/workspace/<repo>` and `/workspace/<repo>-worktrees/...`.
 
 ### `logs`
 
@@ -566,10 +672,10 @@ For the `jungle` example, Cascade uses configured Make and linked-worktree flows
 cascade claim --project-file examples/jungle.yaml --issue 45 --agent oc1 --model openrouter/z-ai/glm-4.7-flash
 ```
 
-2. Show launch prompt:
+2. Start the agent session:
 
 ```bash
-cascade show-prompt oc1 --project jungle
+cascade run-agent oc1 --project jungle
 ```
 
 3. Start plan chat:
@@ -599,7 +705,13 @@ cascade summarize oc1 --project jungle
 7. Continue later:
 
 ```bash
-cascade continue oc1 --project jungle --print-prompt
+cascade continue oc1 --project jungle
+```
+
+Clipboard fallback when you want to paste manually:
+
+```bash
+cascade show-prompt oc1 --project jungle | pbcopy
 ```
 
 ## Deterministic-first workflow
@@ -628,6 +740,34 @@ cascade preflight oc1 --project jungle
 cascade logs oc1 --project jungle --kind preflight
 ```
 
+## Troubleshooting Docker-backed target repos
+
+If OpenCode inside the Cascade container cannot run target repo tests or preflight commands such as `make mandate-preflight`, `docker compose`, or other Docker-backed Make targets, verify host-daemon access first.
+
+Expected setup:
+
+- the Cascade image includes the Docker CLI and Compose plugin
+- `docker-compose.yml` mounts `/var/run/docker.sock:/var/run/docker.sock`
+- Docker commands inside Cascade use the host Docker daemon
+- Cascade does not run privileged Docker-in-Docker and does not start a nested daemon
+
+Useful checks:
+
+```bash
+cascade doctor --project-file examples/jungle.yaml
+docker compose run --rm cascade docker info
+docker compose run --rm cascade docker compose version
+```
+
+If those fail:
+
+- rebuild the image so the Docker CLI and Compose plugin are present: `make rebuild`
+- confirm the host Docker daemon is running
+- confirm `docker-compose.yml` still mounts `/var/run/docker.sock:/var/run/docker.sock`
+- rerun `cascade doctor` and make sure `docker CLI`, `docker socket`, and `docker info` are all `ok`
+
+Once those checks pass, commands launched from paths such as `/workspace/jungle-worktrees/<agent-slug>` can call the host daemon through the target repo's normal `make` and `docker compose` workflows.
+
 Future model-backed diagnosis:
 
 ```bash
@@ -639,6 +779,5 @@ cascade diagnose oc1 --project jungle
 - GitHub issue access uses the local `gh` CLI only.
 - Worktree path resolution is convention-based for now: `<worktree_root>/<agent>-<slug>`.
 - Worktree detection now checks a small set of safe candidate paths, but it is still heuristic.
-- OpenCode prompt injection is manual.
 - Closeout or done commands are still not automated.
 - OpenCode session IDs are stored as placeholders for now; automatic session capture is not implemented in this pass.

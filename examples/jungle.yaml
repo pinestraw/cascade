@@ -42,6 +42,7 @@ instructions:
 
 commands:
   create_worktree: "make agent-worktree-create agent={agent} slug={slug}"
+  init_mandate: "make mandate-init MANDATE_SLUG={slug}"
   preflight: "make mandate-preflight MANDATE_SLUG={slug}"
   done: "make mandate-done MANDATE_SLUG={slug}"
   status: "git status --short"

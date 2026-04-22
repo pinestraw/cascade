@@ -337,6 +337,7 @@ def test_doctor_reports_workspace_root(tmp_path: Path, monkeypatch: pytest.Monke
 
     monkeypatch.setattr("cascade.doctor.shutil.which", _stub_which_gh_only)
     monkeypatch.setattr("cascade.doctor.subprocess.run", lambda *a, **k: _GhAuthOk())
+    monkeypatch.setattr("cascade.doctor._running_in_docker", lambda: False)
 
     checks = run_doctor_checks(project_file)
     check_names = {c.name for c in checks}
@@ -360,6 +361,7 @@ def test_doctor_workspace_root_ok_when_exists(tmp_path: Path, monkeypatch: pytes
 
     monkeypatch.setattr("cascade.doctor.shutil.which", _stub_which_gh_only)
     monkeypatch.setattr("cascade.doctor.subprocess.run", lambda *a, **k: _GhAuthOk())
+    monkeypatch.setattr("cascade.doctor._running_in_docker", lambda: False)
 
     checks = run_doctor_checks(project_file)
     ws_check = next(c for c in checks if c.name == "workspace_root")
@@ -387,6 +389,7 @@ def test_doctor_reports_related_repos(tmp_path: Path, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr("cascade.doctor.shutil.which", _stub_which_gh_only)
     monkeypatch.setattr("cascade.doctor.subprocess.run", lambda *a, **k: _GhAuthOk())
+    monkeypatch.setattr("cascade.doctor._running_in_docker", lambda: False)
 
     checks = run_doctor_checks(project_file)
     check_names = {c.name for c in checks}

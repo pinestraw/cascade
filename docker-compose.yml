@@ -4,18 +4,20 @@ services:
     working_dir: /workspace/cascade
     volumes:
       - ..:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
       - ~/.ssh:/root/.ssh:ro
+      - ~/.cascade/ssh/config:/root/.ssh/config:ro
       - ~/.gitconfig:/root/.gitconfig:ro
       - opencode-data:/root/.local/share/opencode
       - gh-config:/root/.config/gh
     env_file:
-      - path: .env
-        required: false
+      - .env
     environment:
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GH_TOKEN: ${GH_TOKEN}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
     stdin_open: true
     tty: true
 

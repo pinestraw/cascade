@@ -30,7 +30,11 @@ from cascade.gates import classify_gate_failure, load_gate_result
 def _write_project_file(
     tmp_path: Path,
     preflight_cmd: str = "echo preflight-ok",
+    init_mandate_cmd: str | None = None,
 ) -> Path:
+    init_mandate_block = ""
+    if init_mandate_cmd is not None:
+        init_mandate_block = f"\n  init_mandate: {init_mandate_cmd}"
     project_file = tmp_path / "project.yaml"
     project_file.write_text(
         f"""
@@ -43,6 +47,7 @@ paths:
   worktree_root: {tmp_path / "worktrees"}
 commands:
   create_worktree: echo create
+{init_mandate_block}
   preflight: {preflight_cmd}
 models:
   default:
@@ -60,13 +65,14 @@ def _setup_agent(
     project: str = "jungle",
     agent: str = "oc1",
     preflight_cmd: str = "echo preflight-ok",
+    init_mandate_cmd: str | None = None,
 ) -> tuple[Path, Path]:
     worktree = tmp_path / "worktrees" / f"{agent}-test-feature"
     worktree.mkdir(parents=True)
     run_dir = tmp_path / "state" / project / "runs" / agent
     run_dir.mkdir(parents=True)
 
-    project_file = _write_project_file(tmp_path, preflight_cmd=preflight_cmd)
+    project_file = _write_project_file(tmp_path, preflight_cmd=preflight_cmd, init_mandate_cmd=init_mandate_cmd)
     (tmp_path / "repo").mkdir(parents=True, exist_ok=True)
 
     state_path = tmp_path / "state" / project / "agents" / f"{agent}.json"
@@ -256,6 +262,39 @@ def test_preflight_exit_code_determines_pass_fail_not_stdout_text(
     assert result.exit_code != 0, (
         "Preflight with exit code 1 must exit nonzero even if stdout contains passing text."
     )
+
+
+def test_preflight_detects_missing_mandate_metadata_with_specific_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    worktree, _run_dir = _setup_agent(
+        tmp_path,
+        preflight_cmd="make mandate-preflight MANDATE_SLUG={slug}",
+        init_mandate_cmd="make mandate-init MANDATE_SLUG={slug}",
+    )
+    (worktree / ".github" / "mandates").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda cmd, **kwargs: (_ for _ in ()).throw(AssertionError("preflight command must not run before metadata check"))
+        if isinstance(cmd, str) and "mandate-preflight" in cmd
+        else type("_Result", (), {"returncode": 0, "stdout": "ok"})(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "ensure_opencode_available",
+        lambda: (_ for _ in ()).throw(AssertionError("preflight must not check OpenCode")),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["preflight", "oc1", "--project", "jungle"])
+
+    assert result.exit_code != 0
+    assert ".github/mandates/test-feature.json" in result.output
+    assert "make mandate-init MANDATE_SLUG=test-feature" in result.output
+    assert "Required mandate metadata is missing" in result.output
 
 
 # ---------------------------------------------------------------------------

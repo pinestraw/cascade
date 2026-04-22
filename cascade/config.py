@@ -27,6 +27,7 @@ class InstructionsConfig(BaseModel):
 
 class CommandsConfig(BaseModel):
     create_worktree: str
+    init_mandate: str | None = None
     preflight: str | None = None
     done: str | None = None
     status: str | None = None

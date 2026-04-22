@@ -28,11 +28,17 @@ def ensure_opencode_available() -> None:
         raise OpenCodeError("OpenCode CLI `opencode` is not installed or not on PATH.")
 
 
-def build_interactive_command(model: str, mode: OpenCodeMode | None = None) -> list[str]:
+def build_interactive_command(
+    model: str,
+    mode: OpenCodeMode | None = None,
+    prompt: str | None = None,
+) -> list[str]:
     command = ["opencode", ".", "--model", model]
     agent_mode = mode_to_agent(mode)
     if agent_mode is not None:
         command.extend(["--agent", agent_mode])
+    if prompt is not None:
+        command.extend(["--prompt", prompt])
     return command
 
 

@@ -17,6 +17,12 @@ NO_MODEL_COMMANDS: dict[str, CommandMeta] = {
         "requires_gh": False,
         "mutates_target_repo": False,
     },
+    "check": {
+        "description": "Show diff, run preflight, and recommend finish or fix.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": True,
+    },
     "claim": {
         "description": "Claim a GitHub issue and create a configured agent worktree.",
         "requires_opencode": False,
@@ -107,6 +113,18 @@ NO_MODEL_COMMANDS: dict[str, CommandMeta] = {
         "requires_gh": False,
         "mutates_target_repo": False,
     },
+    "finish": {
+        "description": "Verify closeout readiness and optionally mark closeout_ready.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": False,
+    },
+    "next": {
+        "description": "Recommend the next high-level command for the current agent state.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": False,
+    },
     "capabilities": {
         "description": "List command categories and required capabilities.",
         "requires_opencode": False,
@@ -117,6 +135,18 @@ NO_MODEL_COMMANDS: dict[str, CommandMeta] = {
 
 
 MODEL_BACKED_COMMANDS: dict[str, CommandMeta] = {
+    "start": {
+        "description": "Claim, prepare implementation context, and launch OpenCode (unless --no-launch).",
+        "requires_opencode": True,
+        "requires_gh": True,
+        "mutates_target_repo": True,
+    },
+    "fix": {
+        "description": "Prepare fix context from the latest gate failure and optionally launch OpenCode.",
+        "requires_opencode": True,
+        "requires_gh": False,
+        "mutates_target_repo": True,
+    },
     "run-agent": {
         "description": "Launch interactive OpenCode session for an agent.",
         "requires_opencode": True,

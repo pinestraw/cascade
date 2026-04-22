@@ -443,3 +443,126 @@ def test_budget_status_reads_state_without_opencode(
 
     assert result.exit_code == 0, result.output
     assert "oc1" in result.output or "jungle" in result.output
+
+
+# ---------------------------------------------------------------------------
+# check / finish / next — high-level deterministic wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_check_does_not_call_opencode_and_suggests_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _setup_agent(tmp_path)
+    _forbid_opencode(monkeypatch)
+
+    monkeypatch.setattr(cli_module, "get_git_status", lambda _: "M foo.py")
+    monkeypatch.setattr(cli_module, "get_git_diff_stat", lambda _: "1 file changed")
+    monkeypatch.setattr(cli_module, "get_git_diff_names", lambda _: "foo.py")
+
+    class _Completed:
+        returncode = 0
+        stdout = "preflight ok"
+
+    monkeypatch.setattr(cli_module.subprocess, "run", lambda *args, **kwargs: _Completed())
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["check", "oc1", "--project", "jungle"])
+
+    assert result.exit_code == 0, result.output
+    assert "Preflight passed" in result.output
+    assert "cascade finish oc1 --project jungle" in result.output
+
+
+def test_finish_defaults_to_safe_dry_run_behavior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    worktree, run_dir, state_path = _setup_agent(tmp_path)
+    _forbid_opencode(monkeypatch)
+
+    gate_result = {
+        "timestamp": "2026-04-22T12:00:00Z",
+        "command": "echo preflight-ok",
+        "exit_code": 0,
+        "passed": True,
+        "log_path": str(run_dir / "preflight.log"),
+        "git_head_sha": "(unknown)",
+        "diff_fingerprint": "(unknown)",
+        "touched_files": [],
+    }
+    (run_dir / "gate_result.json").write_text(json.dumps(gate_result, indent=2), encoding="utf-8")
+    monkeypatch.setattr(cli_module, "get_git_status", lambda _: "")
+    monkeypatch.setattr(cli_module, "get_git_diff_stat", lambda _: "")
+    monkeypatch.setattr(cli_module, "get_git_diff_names", lambda _: "")
+    monkeypatch.setattr(cli_module, "get_current_branch", lambda _: "agent/oc1/test-feature")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["finish", "oc1", "--project", "jungle"])
+
+    assert result.exit_code == 0, result.output
+    assert "Dry run only" in result.output
+    state_after = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state_after["state"] == "claimed"
+
+
+def test_next_recommends_check_when_no_gate_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _setup_agent(tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["next", "oc1", "--project", "jungle"])
+
+    assert result.exit_code == 0, result.output
+    assert "cascade check oc1 --project jungle" in result.output
+
+
+def test_next_recommends_fix_after_failed_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _worktree, run_dir, _state = _setup_agent(tmp_path)
+    gate_result = {
+        "timestamp": "2026-04-22T12:00:00Z",
+        "command": "echo preflight-fail",
+        "exit_code": 1,
+        "passed": False,
+        "log_path": str(run_dir / "preflight.log"),
+        "git_head_sha": "(unknown)",
+        "diff_fingerprint": "(unknown)",
+        "touched_files": [],
+    }
+    (run_dir / "gate_result.json").write_text(json.dumps(gate_result, indent=2), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["next", "oc1", "--project", "jungle"])
+
+    assert result.exit_code == 0, result.output
+    assert "cascade fix oc1 --project jungle --profile debugger" in result.output
+
+
+def test_next_recommends_finish_after_passing_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _worktree, run_dir, _state = _setup_agent(tmp_path)
+    gate_result = {
+        "timestamp": "2026-04-22T12:00:00Z",
+        "command": "echo preflight-ok",
+        "exit_code": 0,
+        "passed": True,
+        "log_path": str(run_dir / "preflight.log"),
+        "git_head_sha": "(unknown)",
+        "diff_fingerprint": "(unknown)",
+        "touched_files": [],
+    }
+    (run_dir / "gate_result.json").write_text(json.dumps(gate_result, indent=2), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["next", "oc1", "--project", "jungle"])
+
+    assert result.exit_code == 0, result.output
+    assert "cascade finish oc1 --project jungle" in result.output

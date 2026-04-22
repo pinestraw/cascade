@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import platform
+import json
+import shlex
 import subprocess
 from enum import Enum
 from pathlib import Path
@@ -138,6 +140,120 @@ def emit_standards_warnings(project: ProjectConfig | None, agent_state: dict[str
         print_warning(warning)
 
 
+def resolve_prompt_path(run_dir: Path, task: str | None = None, prompt_file: Path | None = None) -> Path:
+    if prompt_file is not None:
+        path = prompt_file
+    elif task is not None:
+        path = run_dir / f"{task}_prompt.md"
+    else:
+        path = run_dir / "launch_prompt.md"
+
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt file not found: {path}")
+    return path
+
+
+def build_prompt_copy_command(
+    agent: str,
+    project: str,
+    task: str | None = None,
+    prompt_file: Path | None = None,
+) -> str:
+    if prompt_file is not None:
+        return f"cat {shlex.quote(str(prompt_file))} | pbcopy"
+
+    command_parts = ["cascade", "show-prompt", agent, "--project", project]
+    if task is not None:
+        command_parts.extend(["--task", task])
+    return f"{' '.join(shlex.quote(part) for part in command_parts)} | pbcopy"
+
+
+def mandate_metadata_dir(worktree: Path) -> Path:
+    return worktree / ".github" / "mandates"
+
+
+def mandate_metadata_path(worktree: Path, slug: str) -> Path:
+    return mandate_metadata_dir(worktree) / f"{slug}.json"
+
+
+def repo_expects_mandate_metadata(worktree: Path) -> bool:
+    return mandate_metadata_dir(worktree).exists()
+
+
+def maybe_initialize_mandate_metadata(
+    project: ProjectConfig,
+    *,
+    worktree: Path,
+    slug: str,
+    agent: str,
+    issue: int,
+) -> None:
+    if not repo_expects_mandate_metadata(worktree):
+        return
+
+    metadata_path = mandate_metadata_path(worktree, slug)
+    if metadata_path.exists():
+        return
+
+    init_command = project.commands.init_mandate
+    if init_command is None:
+        print_warning(
+            "Target repo expects mandate metadata at "
+            f"{metadata_path}, but commands.init_mandate is not configured. "
+            "Preflight may fail until the repo's mandate init workflow is run."
+        )
+        return
+
+    try:
+        rendered_command = init_command.format(
+            agent=agent,
+            slug=slug,
+            issue=issue,
+            project=project.name,
+        )
+        run_command(rendered_command, cwd=worktree)
+    except CommandError as exc:
+        raise CommandError(
+            f"Failed to initialize mandate metadata with commands.init_mandate: {exc}"
+        ) from exc
+
+
+def validate_mandate_metadata_before_preflight(
+    project: ProjectConfig,
+    worktree: Path,
+    slug: str,
+    *,
+    agent: str,
+    issue: int,
+) -> None:
+    if not repo_expects_mandate_metadata(worktree):
+        return
+
+    metadata_path = mandate_metadata_path(worktree, slug)
+    if metadata_path.exists():
+        return
+
+    init_command = project.commands.init_mandate
+    if init_command is None:
+        raise FileNotFoundError(
+            "Required mandate metadata is missing: "
+            f"{metadata_path}. This repo expects .github/mandates/<slug>.json. "
+            "Configure commands.init_mandate or run the repo's mandate init workflow before preflight."
+        )
+
+    suggested_command = init_command.format(
+        agent=agent,
+        slug=slug,
+        issue=issue,
+        project=project.name,
+    )
+
+    raise FileNotFoundError(
+        "Required mandate metadata is missing: "
+        f"{metadata_path}. Run `cascade claim` again or initialize it manually with: {suggested_command}"
+    )
+
+
 @app.command()
 def claim(
     project_file: Path = typer.Option(..., exists=True, dir_okay=False, readable=True),
@@ -183,6 +299,19 @@ def claim(
     if not is_valid_location:
         print_error(location_message)
         raise typer.Exit(1)
+
+    try:
+        maybe_initialize_mandate_metadata(
+            project,
+            worktree=worktree_path,
+            slug=slug,
+            agent=agent,
+            issue=issue_number,
+        )
+    except CommandError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
     mandate_path = run_dir / "mandate.md"
     launch_prompt_path = run_dir / "launch_prompt.md"
     mandate_path.write_text(body, encoding="utf-8")
@@ -227,11 +356,332 @@ def claim(
         print_warning(warning)
 
 
+@app.command(help="Claim issue, prepare implementation context, and launch OpenCode.")
+def start(
+    issue: int = typer.Argument(..., min=1),
+    agent: str = typer.Option(...),
+    project_file: Path = typer.Option(..., exists=True, dir_okay=False, readable=True),
+    profile: str | None = typer.Option(None, help="Optional model profile for implementation cost estimate."),
+    task: str = typer.Option("implement", help=f"Task type: {', '.join(sorted(ALLOWED_TASKS))}"),
+    no_launch: bool = typer.Option(False, "--no-launch", help="Skip launching OpenCode after setup."),
+    engine: str = typer.Option("opencode"),
+    model: str | None = typer.Option(None),
+) -> None:
+    if task not in ALLOWED_TASKS:
+        print_error(f"Unknown task '{task}'. Allowed: {', '.join(sorted(ALLOWED_TASKS))}")
+        raise typer.Exit(1)
+
+    # Step 1: claim issue and initialize state/worktree.
+    claim(
+        project_file=project_file,
+        issue=issue,
+        agent=agent,
+        engine=engine,
+        model=model,
+    )
+
+    try:
+        project_config = load_project_config(project_file)
+        agent_state = load_agent_state(project_config.name, agent)
+    except (ConfigError, FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    try:
+        worktree = require_existing_worktree(agent_state)
+    except FileNotFoundError as exc:
+        print_error(
+            f"{exc} Run the configured create_worktree command or use `cascade claim` to recreate state."
+        )
+        raise typer.Exit(1) from exc
+
+    emit_standards_warnings(project_config, agent_state, worktree)
+
+    run_dir = get_agent_run_dir(project_config.name, agent)
+
+    # Step 2: build deterministic task context pack.
+    try:
+        pack = build_context_pack(project_config, agent_state, task, run_dir)
+        context_md, context_json = save_context_pack(run_dir, pack)
+    except ValueError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    console.print(f"Prepared context: {context_md}")
+    console.print(f"Context metadata: {context_json}")
+
+    # Step 3: estimate cost when profile support is available.
+    selected_profile = profile
+    if selected_profile is None:
+        task_profile = resolve_model_for_task(project_config, task)
+        if task_profile is not None:
+            selected_profile = next(
+                (name for name, value in project_config.models.profiles.items() if value == task_profile),
+                None,
+            )
+
+    if selected_profile is not None:
+        try:
+            model_profile = get_model_profile(project_config, selected_profile)
+            input_tokens = pack.estimated_input_tokens
+            output_tokens = DEFAULT_EXPECTED_OUTPUT_TOKENS.get(task, 10000)
+            for line in cost_summary_lines(input_tokens, output_tokens, model_profile, selected_profile):
+                console.print(line)
+        except ConfigError as exc:
+            print_warning(str(exc))
+
+    if selected_profile is not None:
+        prepare_model_call(
+            agent=agent,
+            project=project_config.name,
+            task=task,
+            profile=selected_profile,
+            include_diff=False,
+        )
+        model_call_meta_path = run_dir / f"{task}_model_call.json"
+        prompt_path = run_dir / f"{task}_prompt.md"
+        if model_call_meta_path.exists():
+            metadata = json.loads(model_call_meta_path.read_text(encoding="utf-8"))
+            console.print(f"Worktree      : {agent_state['worktree']}")
+            console.print(f"Prompt file   : {prompt_path}")
+            console.print(f"Profile       : {selected_profile}")
+            console.print(f"Model         : {metadata.get('model_id', '(unknown)')}")
+            console.print(f"Est. cost USD : {metadata.get('estimated_cost_usd', '(unknown)')}")
+
+    if no_launch:
+        console.print("[green]Start complete (no launch).[/green]")
+        console.print(f"Next: cascade run-agent {agent} --project {project_config.name}")
+        return
+
+    # Step 4: launch OpenCode in the assigned worktree.
+    task_prompt = run_dir / f"{task}_prompt.md"
+    run_agent(
+        agent=agent,
+        project=project_config.name,
+        print_prompt=False,
+        task=task if task_prompt.exists() else None,
+    )
+
+
+@app.command(help="Show diff summary, run preflight, and recommend finish or fix.")
+def check(agent: str, project: str = typer.Option(...)) -> None:
+    diff(agent=agent, project=project, save=True)
+
+    preflight_exit_code = 0
+    try:
+        preflight(agent=agent, project=project)
+    except typer.Exit as exc:
+        preflight_exit_code = int(exc.exit_code or 1)
+
+    run_dir = get_agent_run_dir(project, agent)
+    gate_result = load_gate_result(run_dir)
+    if gate_result is None:
+        print_error("No gate result found after preflight. Check the preflight log.")
+        raise typer.Exit(preflight_exit_code or 1)
+
+    if gate_result.get("passed"):
+        console.print("[green]Preflight passed.[/green]")
+        console.print(f"Next: cascade finish {agent} --project {project}")
+        return
+
+    gate_summary(agent=agent, project=project)
+    console.print(f"Next: cascade fix {agent} --project {project} --profile debugger")
+    raise typer.Exit(preflight_exit_code or 1)
+
+
+@app.command(help="Prepare fix context from the latest gate failure and optionally launch OpenCode.")
+def fix(
+    agent: str,
+    project: str = typer.Option(...),
+    profile: str = typer.Option(...),
+    no_launch: bool = typer.Option(False, "--no-launch"),
+    force_model: bool = typer.Option(False, "--force-model"),
+) -> None:
+    try:
+        agent_state = load_agent_state(project, agent)
+    except (FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    run_dir = get_agent_run_dir(project, agent)
+    log_path = run_dir / "preflight.log"
+    try:
+        log_text = log_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        print_error(f"No preflight log found at {log_path}. Run `cascade check` first.")
+        raise typer.Exit(1) from exc
+
+    gate_summary(agent=agent, project=project)
+    classification = classify_gate_failure(log_text)
+    if not classification.get("model_recommended") and not force_model:
+        console.print(
+            f"Deterministic suggested action: {classification.get('suggested_no_model_action', 'Inspect the gate log manually.')}"
+        )
+        console.print("Model launch skipped because the failure looks deterministic. Use --force-model to override.")
+        return
+
+    project_file_value = agent_state.get("project_file")
+    if not isinstance(project_file_value, str) or not project_file_value:
+        print_error("Agent state does not include project_file.")
+        raise typer.Exit(1)
+
+    try:
+        project_config = load_project_config(Path(project_file_value))
+    except ConfigError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    try:
+        worktree = require_existing_worktree(agent_state)
+    except FileNotFoundError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+    emit_standards_warnings(project_config, agent_state, worktree)
+
+    prepare_model_call(
+        agent=agent,
+        project=project,
+        task="fix",
+        profile=profile,
+        include_diff=False,
+    )
+
+    prompt_path = run_dir / "fix_prompt.md"
+    meta_path = run_dir / "fix_model_call.json"
+    metadata = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    console.print(f"Prompt file   : {prompt_path}")
+    console.print(f"Profile       : {profile}")
+    console.print(f"Model         : {metadata.get('model_id', '(unknown)')}")
+    console.print(f"Est. cost USD : {metadata.get('estimated_cost_usd', '(unknown)')}")
+
+    if no_launch:
+        console.print("[green]Fix context prepared (no launch).[/green]")
+        console.print(f"Next: opencode . --model {metadata.get('model_id', '(model from metadata)')}")
+        return
+
+    try:
+        ensure_opencode_available()
+    except OpenCodeError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    console.print("Use the fix prompt file above. Fix only the specific failure; no unrelated refactors, no gate weakening, no commit/push.")
+    run_agent(agent=agent, project=project, task="fix")
+
+
+@app.command(help="Verify closeout readiness and optionally mark the agent closeout_ready.")
+def finish(
+    agent: str,
+    project: str = typer.Option(...),
+    dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run"),
+    yes: bool = typer.Option(False, "--yes"),
+) -> None:
+    try:
+        agent_state = load_agent_state(project, agent)
+    except (FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    project_config = load_project_from_agent_state(agent_state)
+    if project_config is None:
+        print_error("Unable to load project config from agent state.")
+        raise typer.Exit(1)
+
+    try:
+        worktree = require_existing_worktree(agent_state)
+    except FileNotFoundError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    is_valid_location, location_message = validate_worktree_location(project_config, worktree)
+    if not is_valid_location:
+        print_error(location_message)
+        raise typer.Exit(1)
+
+    if project_config.branches.agent_branch_template is not None:
+        branch_warning = validate_agent_branch(project_config, agent_state, worktree)
+        if branch_warning is not None:
+            print_error(branch_warning)
+            raise typer.Exit(1)
+
+    run_dir = get_agent_run_dir(project, agent)
+    gate_result = load_gate_result(run_dir)
+    if gate_result is None:
+        print_error("No gate result found. Run `cascade check` first.")
+        raise typer.Exit(1)
+    if not gate_result.get("passed"):
+        print_error("Latest preflight did not pass. Run `cascade check` or `cascade fix` first.")
+        raise typer.Exit(1)
+
+    is_stale, stale_reason = check_gate_staleness(gate_result, worktree)
+    if is_stale:
+        print_error(f"Latest preflight is stale: {stale_reason}")
+        raise typer.Exit(1)
+
+    summary_path = run_dir / "closeout_summary.md"
+    summary_body = (
+        "# Closeout Summary\n\n"
+        f"- Project: {project}\n"
+        f"- Agent: {agent}\n"
+        f"- Issue: #{agent_state.get('issue', '')}\n"
+        f"- Title: {agent_state.get('title', '')}\n"
+        f"- Worktree: {worktree}\n"
+        f"- Branch: {get_current_branch(worktree)}\n"
+        f"- Gate: {gate_status_line(gate_result, worktree)}\n"
+        f"- Git status: {get_git_status(worktree) or '(clean)'}\n"
+        f"- Diff stat: {get_git_diff_stat(worktree) or '(none)'}\n"
+        f"- Changed files: {get_git_diff_names(worktree) or '(none)'}\n"
+        "\nSafety: no push or cleanup has been performed.\n"
+    )
+    summary_path.write_text(summary_body, encoding="utf-8")
+    console.print(f"Closeout summary: {summary_path}")
+
+    if not yes:
+        console.print("[yellow]Dry run only.[/yellow] Re-run with --yes to mark closeout_ready.")
+        return
+
+    mark(agent=agent, project=project, state=AgentLifecycleState.closeout_ready)
+
+
+@app.command(help="Recommend the next high-level command based on current agent state.")
+def next(agent: str, project: str = typer.Option(...)) -> None:
+    try:
+        agent_state = load_agent_state(project, agent)
+    except (FileNotFoundError, ValueError) as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
+    state_value = str(agent_state.get("state", ""))
+    run_dir = get_agent_run_dir(project, agent)
+    gate_result = load_gate_result(run_dir)
+
+    if state_value == AgentLifecycleState.blocked.value:
+        console.print(f"Next: inspect logs with `cascade logs {agent} --project {project} --kind preflight`")
+        console.print(f"Then review context with `cascade context {agent} --project {project} --print`")
+        return
+
+    if gate_result is None:
+        console.print(f"Next: cascade check {agent} --project {project}")
+        return
+
+    if not gate_result.get("passed"):
+        console.print(f"Next: cascade fix {agent} --project {project} --profile debugger")
+        return
+
+    console.print(f"Next: cascade finish {agent} --project {project}")
+
+
 @app.command(name="run-agent", help="Launch interactive OpenCode session for this agent.")
 def run_agent(
     agent: str,
     project: str = typer.Option(...),
     print_prompt: bool = typer.Option(False, "--print-prompt"),
+    with_prompt: bool = typer.Option(True, "--with-prompt/--no-prompt"),
+    non_interactive: bool = typer.Option(False, "--non-interactive"),
+    copy_prompt: bool = typer.Option(False, "--copy-prompt"),
+    prompt_file: Path | None = typer.Option(None, "--prompt-file"),
+    task: str | None = typer.Option(None, "--task"),
+    mode: OpenCodeMode | None = typer.Option(None, "--mode"),
 ) -> None:
     try:
         agent_state = load_agent_state(project, agent)
@@ -247,24 +697,37 @@ def run_agent(
         raise typer.Exit(1) from exc
     emit_standards_warnings(project_config, agent_state, worktree)
     model = str(agent_state["model"])
-    prompt_path = get_agent_run_dir(project, agent) / "launch_prompt.md"
+    run_dir = get_agent_run_dir(project, agent)
+
+    prompt_path: Path | None = None
+    prompt_text: str | None = None
+    if with_prompt:
+        try:
+            prompt_path = resolve_prompt_path(run_dir, task=task, prompt_file=prompt_file)
+            prompt_text = prompt_path.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            print_error(str(exc))
+            raise typer.Exit(1) from exc
+
+    if non_interactive and not with_prompt:
+        print_error("--non-interactive requires prompt injection. Remove --no-prompt or provide a prompt source.")
+        raise typer.Exit(1)
 
     console.print(f"Worktree: {worktree}")
     console.print(f"Model: {model}")
-    console.print(f"Prompt: {prompt_path}")
-    if platform.system() == "Darwin":
-        console.print(f"Clipboard: pbcopy < {prompt_path}")
-    console.print(
-        "Paste or load the generated launch prompt from "
-        f"{prompt_path} after OpenCode starts."
-    )
+    if prompt_path is not None:
+        console.print(f"Prompt: {prompt_path}")
+        if platform.system() == "Darwin":
+            console.print(f"Clipboard fallback: {build_prompt_copy_command(agent, project, task=task, prompt_file=prompt_file)}")
+    if copy_prompt and prompt_path is not None:
+        console.print(f"Copy prompt on host with: {build_prompt_copy_command(agent, project, task=task, prompt_file=prompt_file)}")
+    if with_prompt and not non_interactive and prompt_path is not None:
+        console.print("OpenCode will start with the selected prompt loaded automatically.")
+    elif prompt_path is not None:
+        console.print(f"Prompt available at: {prompt_path}")
 
-    if print_prompt:
-        try:
-            console.print(prompt_path.read_text(encoding="utf-8"))
-        except FileNotFoundError as exc:
-            print_error(f"Launch prompt not found: {prompt_path}")
-            raise typer.Exit(1) from exc
+    if print_prompt and prompt_text is not None:
+        console.print(prompt_text)
 
     try:
         ensure_opencode_available()
@@ -272,10 +735,32 @@ def run_agent(
         print_error(str(exc))
         raise typer.Exit(1)
 
-    result = subprocess.run(build_interactive_command(model), cwd=worktree, check=False)
-    if result.returncode != 0:
-        print_error(f"OpenCode exited with status {result.returncode}.")
-        raise typer.Exit(result.returncode)
+    if non_interactive:
+        try:
+            output = run_prompt(
+                prompt=prompt_text or "",
+                worktree=worktree,
+                model=model,
+                mode=mode,
+                use_continue=False,
+            )
+        except OpenCodeError as exc:
+            print_error(str(exc))
+            raise typer.Exit(1) from exc
+        console.print(output)
+    else:
+        result = subprocess.run(
+            build_interactive_command(model, mode=mode, prompt=prompt_text if with_prompt else None),
+            cwd=worktree,
+            check=False,
+        )
+        if result.returncode != 0:
+            print_error(f"OpenCode exited with status {result.returncode}.")
+            raise typer.Exit(result.returncode)
+
+    agent_state["last_mode"] = mode.value if mode is not None else None
+    agent_state["last_interaction_at"] = timestamp_utc()
+    save_agent_state(project, agent, agent_state)
 
 
 @app.command()
@@ -316,8 +801,13 @@ def status(project: str = typer.Option(...)) -> None:
 
 
 @app.command(name="show-prompt")
-def show_prompt(agent: str, project: str = typer.Option(...)) -> None:
-    prompt_path = get_agent_run_dir(project, agent) / "launch_prompt.md"
+def show_prompt(
+    agent: str,
+    project: str = typer.Option(...),
+    task: str | None = typer.Option(None, "--task"),
+    prompt_file: Path | None = typer.Option(None, "--prompt-file"),
+) -> None:
+    prompt_path = resolve_prompt_path(get_agent_run_dir(project, agent), task=task, prompt_file=prompt_file)
     try:
         prompt = prompt_path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
@@ -1026,6 +1516,18 @@ def preflight(agent: str, project: str = typer.Option(...)) -> None:
         raise typer.Exit(1) from exc
     emit_standards_warnings(project_config, agent_state, worktree)
 
+    try:
+        validate_mandate_metadata_before_preflight(
+            project_config,
+            worktree,
+            str(agent_state["slug"]),
+            agent=agent,
+            issue=int(agent_state["issue"]),
+        )
+    except FileNotFoundError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+
     run_dir = get_agent_run_dir(project, agent)
     log_path = run_dir / "preflight.log"
     preflight_command = project_config.commands.preflight.format(
@@ -1396,22 +1898,13 @@ def continue_agent(
     if print_prompt:
         console.print(continue_prompt)
 
-    try:
-        ensure_opencode_available()
-    except OpenCodeError as exc:
-        print_error(str(exc))
-        raise typer.Exit(1) from exc
-
-    result = subprocess.run(build_interactive_command(str(agent_state["model"]), mode=mode), cwd=worktree, check=False)
-    if result.returncode != 0:
-        print_error(
-            f"OpenCode exited with status {result.returncode}. If this appears flag-related, check `opencode --help`."
-        )
-        raise typer.Exit(result.returncode)
-
-    agent_state["last_mode"] = mode.value if mode is not None else None
-    agent_state["last_interaction_at"] = timestamp_utc()
-    save_agent_state(project, agent, agent_state)
+    run_agent(
+        agent=agent,
+        project=project,
+        print_prompt=print_prompt,
+        task="continue",
+        mode=mode,
+    )
 
 
 def default_model_name(project: ProjectConfig) -> str:
