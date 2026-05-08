@@ -30,6 +30,8 @@ Cascade intentionally keeps most steps deterministic. Model calls are reserved f
 | `logs` | no | no | run artifact output |
 | `preflight` | no | no | deterministic configured validation run |
 | `repair` | no | no | deterministic safe workflow repair actions |
+| `loop` | no | no | bounded preflight -> classify -> fix -> rerun controller |
+| `loop-status` | no | no | latest repair loop status and stop reason |
 | `capabilities` | no | no | command category and capability matrix |
 | `run-agent` | yes | yes | OpenCode interactive session |
 | `chat` | yes | yes | OpenCode interactive session with optional mode |
@@ -61,9 +63,23 @@ cascade check a1 --project jungle --repair
 cascade check a1 --project jungle --repair-only
 ```
 
+Preflight visibility modes:
+
+```bash
+cascade check a2 --project jungle --verbose
+cascade check a2 --project jungle --watch
+cascade preflight a2 --project jungle --watch
+```
+
+Mode behavior:
+
+- default keeps the existing compact output and still writes `preflight.log` plus `gate_result.json`
+- `--verbose` prints high-level progress plus periodic recent log-tail updates while preflight is running
+- `--watch` streams the full live preflight output to the terminal with `[preflight]` prefixes while also saving the same run output to `preflight.log`
+
 Behavior guarantees:
 
-- runs inside the same Docker-backed context as other `cascade` wrapper commands
+- runs in the same execution mode as your active wrapper (`cascade` host-first, `cascade-docker` Docker)
 - does not call OpenCode or any model API
 - does not push to remotes
 - writes a repair log under the agent run directory
@@ -74,6 +90,127 @@ Dirty-worktree safety:
 - runs the repair command
 - attempts `git stash pop` after repair
 - if stash restore conflicts, Cascade keeps the stash entry and prints guidance instead of dropping data
+
+## Deterministic dirty-file repair
+
+Cascade can auto-revert explicitly configured tracked files that become dirty (uncommitted changes) during mandate closeout operations. This is useful for deterministic scripts or helper files that are safe to revert without losing work.
+
+Configuration:
+
+Add a `dirty_file_repairs` section to your project config to specify which files can be auto-reverted:
+
+```yaml
+dirty_file_repairs:
+  auto_revert_tracked:
+    - "scripts/ensure_docker_desktop.sh"
+    - "scripts/setup-*.sh"
+  never_revert:
+    - ".github/mandates/**"
+    - ".pre-commit-config.yaml"
+    - "pyproject.toml"
+    - "Makefile"
+    - "scripts/pre_commit*"
+    - ".github/workflows/**"
+```
+
+Safety guarantees:
+
+- Only tracked files (checked into git) can be reverted
+- Untracked files are never deleted
+- Files matching `never_revert` patterns are protected and cannot be reverted even if in `auto_revert_tracked`
+- Uses deterministic `git checkout --` to revert changes
+- No model calls or external APIs
+
+Usage:
+
+Manually repair a specific dirty file:
+
+```bash
+cascade repair a1 --project jungle --kind dirty-file --file scripts/ensure_docker_desktop.sh
+```
+
+During the auto-repair loop, Cascade will:
+
+1. Detect dirty-file failures during mandate closeout
+2. Check if the file is in `auto_revert_tracked` and not in `never_revert`
+3. If safe to revert: automatically revert with `git checkout --` and rerun preflight
+4. If not safe to revert: stop with `needs_human` and suggest the `cascade repair` command
+
+Example loop run:
+
+```bash
+cascade loop a1 --project jungle --watch
+cascade loop-status a1 --project jungle
+```
+
+The loop will continue automatically after successful dirty-file repairs and stop with clear guidance when human review is needed.
+
+## Auto-repair loop
+
+Run the bounded controller with:
+
+```bash
+cascade loop a1 --project jungle
+```
+
+Explicit bounded run:
+
+```bash
+cascade loop a1 --project jungle --max-iterations 3 --max-model-fixes 2 --max-estimated-cost 2.50
+```
+
+What it does:
+
+- runs configured preflight/check first
+- classifies failures and chooses strategy
+- tries deterministic no-model fixes first when configured and safe
+- launches bounded model-backed fixes only when needed
+- when OpenCode exits, immediately reruns preflight/check
+- treats only preflight/check exit code and gate result as proof of completion
+- stops on pass, repeated same failure, budget, attempt limits, approval-required categories, or other safety stop conditions
+
+Examples:
+
+```bash
+cascade loop a1 --project jungle
+cascade loop a1 --project jungle --max-iterations 2 --max-estimated-cost 1.00
+cascade loop a2 --project jungle --watch
+cascade loop a1 --project jungle --non-interactive
+cascade loop a1 --project jungle --finish-on-pass
+cascade loop-status a1 --project jungle
+```
+
+You can also route from check:
+
+```bash
+cascade check a1 --project jungle --auto-fix
+```
+
+`check --auto-fix` uses tighter defaults (`max_iterations=2`, `max_model_fixes=1`, `max_estimated_cost=1.00`).
+
+`cascade loop --watch` also streams each preflight run live between model-fix attempts, so long validation steps do not look idle.
+
+Cost controls:
+
+- max iterations (`--max-iterations`)
+- max model fixes (`--max-model-fixes`)
+- estimated budget cap (`--max-estimated-cost`)
+- category routing with cheaper profiles first when configured (`debugger` before `executor` for unknowns)
+- bounded prompts and log tails (no full transcript replay)
+- repeated-failure signature stop to avoid burning model budget
+
+Safety guarantees:
+
+- no auto-push
+- no auto-commit
+- no gate weakening or bypassing
+- security/policy/migration categories stop for human approval by default
+- warnings and stop when forbidden gate-enforcement files are touched during a fix attempt
+
+On pass, loop prints:
+
+- `Loop complete: preflight passed.`
+- `cascade finish <agent> --project <project>` as the next explicit command
 
 ## Requirements
 
@@ -89,14 +226,113 @@ Your active dev shell must be running Python 3.11+ before creating the virtualen
 
 ```bash
 cp .env.example .env   # fill in API keys
-make build             # prepare SSH + wrapper, then build the Docker image
 ```
 
-`make build` now performs standard host/Docker setup:
+## Recommended local setup
+
+```bash
+make install
+```
+
+`make install` is the one-shot setup command. End state:
+
+- `cascade` is host-native
+- `cascade-docker` is Docker-backed
+
+This avoids stale-wrapper confusion where rebuilding the Docker image does not update your host `cascade` command.
+
+On macOS/Homebrew (PEP 668 externally-managed Python), prefer repo-local virtualenv setup:
+
+```bash
+make install-venv PYTHON=/path/to/python3
+```
+
+This creates `.venv`, installs Cascade there, and wires `~/.local/bin/cascade` to `.venv/bin/python`.
+
+Host-native Make targets automatically prefer `.venv/bin/python` when `.venv` exists.
+You can still override explicitly, for example:
+
+```bash
+make doctor-host PYTHON=/path/to/python
+```
+
+Host-native Cascade also auto-loads selected values from the repo `.env` file (when present),
+without overriding already-exported environment variables. This mirrors Docker Compose behavior
+for common auth/build variables such as `GH_TOKEN`, `GITHUB_TOKEN`, `OPENROUTER_API_KEY`,
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DOCKER_BUILDKIT`, and `COMPOSE_DOCKER_CLI_BUILD`.
+
+## Execution modes
+
+Cascade supports two execution modes.
+
+### Recommended: host-native Cascade
+
+Run Cascade on the host, while target repos continue to use Docker normally.
+
+Why this is recommended:
+
+- avoids container-to-host path mismatches when target repos call host Docker
+- keeps target repo Docker workflows unchanged
+- simplifies local debugging and editor integration
+
+Install and verify:
+
+```bash
+make install-venv
+make wrapper-check
+make doctor-host
+make test-host
+```
+
+Equivalent manual install path:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip setuptools wheel
+.venv/bin/python -m pip install -e ".[dev]"
+make install-wrapper
+```
+
+Wrapper behavior:
+
+- `cascade` is host-native by default
+- `cascade-docker` is explicit Docker mode
+
+### Optional: Dockerized Cascade (reproducible mode)
+
+Docker mode is still fully supported for reproducibility and environment parity.
+
+Use:
+
+```bash
+make build
+make shell
+make test
+make wrapper-check-docker
+```
+
+Install explicit Docker wrapper:
+
+```bash
+make install-wrapper-docker
+```
+
+By default this installs `cascade-docker` at `~/.local/bin/cascade-docker`.
+
+Important caveat for Dockerized Cascade:
+
+- if Cascade runs in Docker and target repos invoke the host Docker daemon, bind mounts can fail when container paths (for example `/workspace/...`) do not match host paths (for example `/Users/...`)
+- prefer host-native Cascade for this case, or configure host-path parity deliberately
+
+## Docker image build flow
+
+`make build` builds the Docker image (and Docker-safe SSH config) only:
 
 - prepares Docker-safe SSH config (`make ssh-config`)
-- installs/updates the host `cascade` wrapper (`make install-wrapper`)
 - builds the Docker image (`make docker-build`)
+
+`make build` does not install or fix host wrapper commands.
+To install host-native `cascade`, run `make install-host` (or `make install`).
 
 If you need image build only (no host setup changes), use:
 
@@ -107,12 +343,12 @@ make docker-build
 For running Cascade locally (outside Docker), you still need a 3.11+ Python and can install with:
 
 ```bash
-pip install -e .
+python3 -m pip install -e ".[dev]"
 ```
 
 ## Running with Docker Compose
 
-Docker is the preferred reproducible workflow.  The container includes Python,
+Docker is an optional reproducible workflow. The container includes Python,
 Node.js, OpenCode (`opencode-ai`), the GitHub CLI (`gh`), the Docker CLI with
 the Compose plugin, and Cascade itself.
 
@@ -120,22 +356,24 @@ Cascade uses the host Docker daemon through the mounted host socket at
 `/var/run/docker.sock`. It does not run privileged Docker-in-Docker and does
 not start a nested Docker daemon.
 
-## Host `cascade` wrapper (Docker-backed)
+## Wrapper commands
 
-You can install a host-side `cascade` wrapper so commands run in Docker Compose
-without typing `make cascade ARGS=...`.
+Cascade provides both host-first and Docker-explicit wrappers.
 
 Install:
 
 ```bash
-make install-wrapper
+make install-host
+make install-wrapper-docker
 make wrapper-check
+make wrapper-check-docker
 ```
 
 Then use from your host shell:
 
 ```bash
 cascade status --project jungle
+cascade-docker status --project jungle
 cascade claim --project-file examples/jungle.yaml --issue 44 --agent a1 --engine opencode --model openrouter/z-ai/glm-4.7
 cascade run-agent a1 --project jungle
 ```
@@ -143,13 +381,15 @@ cascade run-agent a1 --project jungle
 Notes:
 
 - The wrapper is installed by default at `~/.local/bin/cascade`.
-- It runs `docker compose run --rm cascade cascade "$@"` from the Cascade repo root.
+- The Docker wrapper is installed by default at `~/.local/bin/cascade-docker`.
+- `cascade` is host-native and should not invoke Docker.
+- `cascade-docker` always runs `docker compose run --rm cascade cascade "$@"` from the Cascade repo root.
 - Interactive commands (`run-agent`, `chat`) preserve TTY behavior.
 - Docker-backed target repo commands run against the host Docker daemon through `/var/run/docker.sock`.
-- Customize install path with `make install-wrapper WRAPPER_BIN=/custom/path/cascade`.
+- Customize install paths with `make install-wrapper WRAPPER_BIN=/custom/path/cascade` and `make install-wrapper-docker WRAPPER_DOCKER_BIN=/custom/path/cascade-docker`.
 - If an existing non-Cascade wrapper is present, install/build fails safely.
-- Override that guard with `make install-wrapper FORCE=1` or `make build FORCE=1`.
-- Verify installation with `make wrapper-check`.
+- Override that guard with `make install-wrapper FORCE=1` or `make install-wrapper-docker FORCE=1`.
+- Verify installation with `make wrapper-check` and `make wrapper-check-docker`.
 
 ## Docker SSH setup for private repos
 

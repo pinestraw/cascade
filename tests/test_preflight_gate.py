@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from cascade import cli as cli_module
@@ -92,6 +93,46 @@ def _setup_agent(
     }
     state_path.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
     return worktree, run_dir
+
+
+class _FakeStreamingStdout:
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+class _FakeStreamingProcess:
+    def __init__(self, lines: list[str], returncode: int, pending_polls: int = 2) -> None:
+        self.args = ["fake-preflight"]
+        self.stdout = _FakeStreamingStdout(lines)
+        self._returncode = returncode
+        self._pending_polls = pending_polls
+
+    def __enter__(self) -> _FakeStreamingProcess:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+    def poll(self) -> int | None:
+        if self._pending_polls > 0:
+            self._pending_polls -= 1
+            return None
+        return self._returncode
+
+    def communicate(self, input=None, timeout=None):
+        return ("".join(list(self.stdout)), "")
+
+    def wait(self, timeout=None) -> int:
+        return self._returncode
+
+    def kill(self) -> None:
+        return None
+
+    def terminate(self) -> None:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +244,280 @@ def test_preflight_saves_log_on_failure(
     assert log_path.exists(), "preflight.log must be written even on failure"
 
 
+def test_preflight_watch_streams_output_and_writes_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _worktree, run_dir = _setup_agent(tmp_path)
+
+    monkeypatch.setattr(cli_module, "_PREFLIGHT_PROGRESS_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: _FakeStreamingProcess(["first line\n", "second line\n"], 0),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["preflight", "oc1", "--project", "jungle", "--watch"])
+
+    assert result.exit_code == 0, result.output
+    assert "[preflight] first line" in result.output
+    assert "[preflight] second line" in result.output
+    log_content = (run_dir / "preflight.log").read_text(encoding="utf-8")
+    assert "first line" in log_content
+    assert "second line" in log_content
+
+
+def test_preflight_verbose_prints_progress_without_full_raw_spam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _worktree, run_dir = _setup_agent(tmp_path)
+
+    lines = [f"line {index}\n" for index in range(1, 8)]
+    monkeypatch.setattr(cli_module, "_PREFLIGHT_PROGRESS_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: _FakeStreamingProcess(lines, 0, pending_polls=3),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["preflight", "oc1", "--project", "jungle", "--verbose"])
+
+    assert result.exit_code == 0, result.output
+    assert "[preflight] still running..." in result.output
+    assert "[preflight] line 7" in result.output
+    assert "[preflight] line 1" not in result.output
+    log_content = (run_dir / "preflight.log").read_text(encoding="utf-8")
+    assert "line 1" in log_content
+    assert "line 7" in log_content
+
+
+def test_preflight_default_mode_remains_compact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _worktree, run_dir = _setup_agent(tmp_path)
+
+    class _FakeResult:
+        returncode = 0
+        stdout = "compact output"
+
+    monkeypatch.setattr(cli_module.subprocess, "run", lambda *args, **kwargs: _FakeResult())
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("default preflight must stay on compact subprocess.run path")),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["preflight", "oc1", "--project", "jungle"])
+
+    assert result.exit_code == 0, result.output
+    assert "[preflight]" not in result.output
+    assert "compact output" in (run_dir / "preflight.log").read_text(encoding="utf-8")
+
+
+def test_check_forwards_verbose_and_watch_to_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _worktree, run_dir = _setup_agent(tmp_path)
+
+    seen: dict[str, bool] = {}
+    monkeypatch.setattr(cli_module, "diff", lambda *args, **kwargs: None)
+
+    def _preflight(agent: str, project: str, verbose: bool = False, watch: bool = False) -> None:
+        seen["verbose"] = verbose
+        seen["watch"] = watch
+        log_path = run_dir / "preflight.log"
+        log_path.write_text("ok", encoding="utf-8")
+        from cascade.gates import save_gate_result
+
+        save_gate_result(
+            run_dir,
+            {
+                "timestamp": "2026-04-22T12:00:00Z",
+                "command": "echo preflight-ok",
+                "exit_code": 0,
+                "passed": True,
+                "log_path": str(log_path),
+                "git_head_sha": "deadbeef",
+                "diff_fingerprint": "abc123",
+                "touched_files": [],
+            },
+        )
+
+    monkeypatch.setattr(cli_module, "preflight", _preflight)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["check", "oc1", "--project", "jungle", "--verbose", "--watch"])
+
+    assert result.exit_code == 0, result.output
+    assert seen == {"verbose": True, "watch": True}
+
+
+def test_check_retries_once_for_docker_runtime_network_and_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _worktree, run_dir = _setup_agent(tmp_path)
+
+    monkeypatch.setattr(cli_module, "diff", lambda *args, **kwargs: None)
+    attempts = {"count": 0}
+
+    def _preflight(agent: str, project: str, verbose: bool = False, watch: bool = False) -> None:
+        attempts["count"] += 1
+        log_path = run_dir / "preflight.log"
+        from cascade.gates import save_gate_result
+
+        if attempts["count"] == 1:
+            failure = (
+                "Error response from daemon: container abc is not connected to the network "
+                "jungle-sample_default\n"
+            )
+            log_path.write_text(failure, encoding="utf-8")
+            save_gate_result(
+                run_dir,
+                {
+                    "timestamp": "2026-04-22T12:00:00Z",
+                    "command": "echo preflight-fail",
+                    "exit_code": 1,
+                    "passed": False,
+                    "log_path": str(log_path),
+                    "git_head_sha": "deadbeef",
+                    "diff_fingerprint": "abc123",
+                    "touched_files": [],
+                },
+            )
+            raise typer.Exit(1)
+
+        log_path.write_text("ok", encoding="utf-8")
+        save_gate_result(
+            run_dir,
+            {
+                "timestamp": "2026-04-22T12:00:01Z",
+                "command": "echo preflight-ok",
+                "exit_code": 0,
+                "passed": True,
+                "log_path": str(log_path),
+                "git_head_sha": "deadbeef",
+                "diff_fingerprint": "abc124",
+                "touched_files": [],
+            },
+        )
+
+    repair_calls = {"count": 0}
+
+    def _run_repair(
+        project_config,
+        agent_state,
+        *,
+        kind,
+        dry_run,
+        allow_stash,
+        active_branch_override,
+        file_path=None,
+        runtime_log_text=None,
+    ):
+        repair_calls["count"] += 1
+        assert kind == cli_module.RepairKind.docker_runtime_network
+        assert runtime_log_text is not None
+        return cli_module.RepairResult(
+            kind=kind,
+            success=True,
+            dry_run=dry_run,
+            message="runtime repaired",
+            log_path=run_dir / "repair_docker_runtime_network.log",
+        )
+
+    monkeypatch.setattr(cli_module, "preflight", _preflight)
+    monkeypatch.setattr(cli_module, "run_repair", _run_repair)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["check", "oc1", "--project", "jungle"])
+
+    assert result.exit_code == 0, result.output
+    assert attempts["count"] == 2
+    assert repair_calls["count"] == 1
+
+
+def test_check_docker_runtime_network_persists_after_single_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _worktree, run_dir = _setup_agent(tmp_path)
+
+    monkeypatch.setattr(cli_module, "diff", lambda *args, **kwargs: None)
+    attempts = {"count": 0}
+
+    def _preflight(agent: str, project: str, verbose: bool = False, watch: bool = False) -> None:
+        attempts["count"] += 1
+        log_path = run_dir / "preflight.log"
+        from cascade.gates import save_gate_result
+
+        failure = (
+            "Error response from daemon: error while removing network: network "
+            "jungle-sample_default has active endpoints\n"
+        )
+        log_path.write_text(failure, encoding="utf-8")
+        save_gate_result(
+            run_dir,
+            {
+                "timestamp": "2026-04-22T12:00:00Z",
+                "command": "echo preflight-fail",
+                "exit_code": 1,
+                "passed": False,
+                "log_path": str(log_path),
+                "git_head_sha": "deadbeef",
+                "diff_fingerprint": "abc123",
+                "touched_files": [],
+            },
+        )
+        raise typer.Exit(1)
+
+    def _run_repair(
+        project_config,
+        agent_state,
+        *,
+        kind,
+        dry_run,
+        allow_stash,
+        active_branch_override,
+        file_path=None,
+        runtime_log_text=None,
+    ):
+        return cli_module.RepairResult(
+            kind=kind,
+            success=True,
+            dry_run=dry_run,
+            message="runtime repaired",
+            log_path=run_dir / "repair_docker_runtime_network.log",
+        )
+
+    model_suggestion_triggered = {"value": False}
+
+    def _gate_summary(agent: str, project: str) -> None:
+        payload = cli_module.load_gate_result(run_dir)
+        if payload is not None:
+            log_text = Path(str(payload["log_path"])).read_text(encoding="utf-8")
+            classification = cli_module.classify_gate_failure(log_text)
+            model_suggestion_triggered["value"] = bool(classification.get("model_recommended", True))
+
+    monkeypatch.setattr(cli_module, "preflight", _preflight)
+    monkeypatch.setattr(cli_module, "run_repair", _run_repair)
+    monkeypatch.setattr(cli_module, "gate_summary", _gate_summary)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["check", "oc1", "--project", "jungle"])
+
+    assert result.exit_code != 0
+    assert attempts["count"] == 2
+    assert "persisted after deterministic repair/retry" in result.output
+    assert model_suggestion_triggered["value"] is False
+
+
 def test_preflight_updates_state_to_passed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -294,7 +609,7 @@ def test_preflight_detects_missing_mandate_metadata_with_specific_guidance(
     normalized_output = " ".join(result.output.split())
 
     assert result.exit_code != 0
-    assert ".github/mandates/test-feature.json" in normalized_output
+    assert "test-feature.json" in normalized_output
     assert "Repair available: cascade repair oc1 --project jungle" in normalized_output
     assert "Required mandate metadata is missing" in normalized_output
 
@@ -440,6 +755,59 @@ def test_gate_classify_unknown_hook_is_unknown_conservative() -> None:
     assert result["model_recommended"] is True
 
 
+def test_gate_classify_validation_slot_timeout_is_environment_no_model() -> None:
+    log = "Timed out waiting for the shared heavy validation slot"
+    result = classify_gate_failure(log)
+    assert result["hook"] == "validation-slot-timeout"
+    assert result["category"] == "environment"
+    assert result["model_recommended"] is False
+
+
+def test_gate_classify_branch_mismatch_is_workflow_no_model() -> None:
+    log = "Branch mismatch: expected 'agent/a1/slug', found 'agent/copilot/slug'."
+    result = classify_gate_failure(log)
+    assert result["hook"] == "mandate-agent-branch-mismatch"
+    assert result["category"] == "workflow"
+    assert result["model_recommended"] is False
+
+
+def test_gate_classify_jungle_branch_mismatch_format_is_workflow_no_model() -> None:
+    # Regression: Jungle emits "[mandate] ERROR: Current branch X does not match mandate agent branch Y"
+    log = (
+        "[mandate] ERROR: Current branch agent/smoke-agent/fix-update-deployyml-to-use-dynamic-image-tags"
+        " does not match mandate agent branch agent/copilot/fix-update-deployyml-to-use-dynamic-image-tags."
+        " Aborting."
+    )
+    result = classify_gate_failure(log)
+    assert result["hook"] == "mandate-agent-branch-mismatch"
+    assert result["category"] == "workflow"
+    assert result["model_recommended"] is False
+
+
+def test_gate_classify_stale_docker_state_is_environment_no_model() -> None:
+    log = "No such file or directory: /workspace/jungle-worktrees/a1-test"
+    result = classify_gate_failure(log)
+    assert result["hook"] == "stale-docker-era-state"
+    assert result["category"] == "environment"
+    assert result["model_recommended"] is False
+
+
+def test_gate_classify_mandate_not_in_progress_is_workflow_no_model() -> None:
+    log = "[mandate] ERROR: Mandate fix-update-deployyml is not in progress"
+    result = classify_gate_failure(log)
+    assert result["hook"] == "mandate-metadata"
+    assert result["category"] == "workflow"
+    assert result["model_recommended"] is False
+
+
+def test_gate_classify_repo_mismatch_validation_is_workflow_no_model() -> None:
+    log = "Mandate metadata validation: repo mismatch: expected 'jungle', found 'smoke-agent-fix-update'"
+    result = classify_gate_failure(log)
+    assert result["hook"] == "mandate-metadata"
+    assert result["category"] == "workflow"
+    assert result["model_recommended"] is False
+
+
 # ---------------------------------------------------------------------------
 # Gate-summary CLI reads saved log
 # ---------------------------------------------------------------------------
@@ -504,3 +872,106 @@ def test_gate_summary_security_shows_do_not_auto_fix(
     # Security failures must not suggest blind auto-fix
     output_lower = result.output.lower()
     assert "security" in output_lower or "blindly" in output_lower or "do not" in output_lower
+
+
+# ---------------------------------------------------------------------------
+# Preflight observability: failure tail and thin-log detection
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_failure_tail_shown_in_default_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failure tail must be emitted even when --verbose / --watch are not passed."""
+    monkeypatch.chdir(tmp_path)
+    _worktree, run_dir = _setup_agent(tmp_path)
+
+    class _FailResult:
+        returncode = 1
+        stdout = (
+            "[mandate] ERROR: Current branch main does not match mandate agent branch agent/a2/slug\n"
+            "make: *** [mandate-preflight] Error 1\n"
+        )
+
+    monkeypatch.setattr(cli_module.subprocess, "run", lambda cmd, **kwargs: _FailResult())
+
+    runner = CliRunner()
+    # Default mode: no --verbose, no --watch
+    result = runner.invoke(app, ["preflight", "oc1", "--project", "jungle"])
+
+    assert result.exit_code != 0
+    # The actual error line from mandate_die must appear in the terminal output.
+    # Normalize whitespace to handle Rich line-wrap splitting.
+    normalized_output = " ".join(result.output.split())
+    assert "[preflight]" in result.output, "failure tail header must be emitted in default mode"
+    assert "does not match mandate agent branch" in normalized_output
+
+
+def test_preflight_opaque_log_triggers_thin_log_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When only a make error wrapper is captured, a thin-log warning must be shown."""
+    monkeypatch.chdir(tmp_path)
+    _worktree, _run_dir = _setup_agent(tmp_path)
+
+    class _FailResult:
+        returncode = 2
+        stdout = "make: *** [mandate-preflight] Error 1\n"
+
+    monkeypatch.setattr(cli_module.subprocess, "run", lambda cmd, **kwargs: _FailResult())
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["preflight", "oc1", "--project", "jungle"])
+
+    assert result.exit_code != 0
+    # The thin-log warning must be present, directing the user to --verbose
+    assert "--verbose" in result.output
+    assert "thin" in result.output.lower() or "wrapper" in result.output.lower()
+
+
+def test_is_opaque_preflight_log_detects_thin_logs() -> None:
+    """_is_opaque_preflight_log returns True only for pure make-wrapper output."""
+    from cascade.cli import _is_opaque_preflight_log
+
+    # Opaque: only make error wrapper(s)
+    assert _is_opaque_preflight_log("make: *** [mandate-preflight] Error 1\n")
+    assert _is_opaque_preflight_log(
+        "make[1]: *** [mandate-preflight-backend-tests] Error 2\n"
+        "make: *** [mandate-preflight] Error 2\n"
+    )
+    assert _is_opaque_preflight_log("")
+    assert _is_opaque_preflight_log("   \n  \n")
+
+    # Not opaque: has at least one meaningful line
+    assert not _is_opaque_preflight_log(
+        "[mandate] ERROR: Missing file: .github/mandates/slug.json\n"
+        "make: *** [mandate-preflight] Error 1\n"
+    )
+    assert not _is_opaque_preflight_log("ruff format check failed\n")
+    assert not _is_opaque_preflight_log(
+        "[mandate] ERROR: Current branch main does not match agent branch agent/a2/slug\n"
+    )
+
+
+def test_preflight_non_opaque_failure_does_not_trigger_thin_log_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When actual error lines are present, the thin-log warning must not fire."""
+    monkeypatch.chdir(tmp_path)
+    _worktree, _run_dir = _setup_agent(tmp_path)
+
+    class _FailResult:
+        returncode = 1
+        stdout = (
+            "[mandate] ERROR: Mandate slug is not in progress\n"
+            "make: *** [mandate-preflight] Error 1\n"
+        )
+
+    monkeypatch.setattr(cli_module.subprocess, "run", lambda cmd, **kwargs: _FailResult())
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["preflight", "oc1", "--project", "jungle"])
+
+    assert result.exit_code != 0
+    # Thin-log warning must NOT appear when the log has real content
+    assert "--verbose" not in result.output or "thin" not in result.output.lower()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import json
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from cascade import cli as cli_module
-from cascade.cli import app
+from cascade.cli import app, resolve_prompt_path
 from cascade.config import ModelProfile
 from cascade.opencode import OpenCodeMode, mode_to_agent
 
@@ -182,6 +183,37 @@ def test_run_agent_uses_launch_prompt_by_default(
     assert captured["cwd"] == worktree
 
 
+def test_resolve_prompt_path_defaults_to_launch_prompt(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    launch_prompt = run_dir / "launch_prompt.md"
+    launch_prompt.write_text("# Launch Prompt\n", encoding="utf-8")
+
+    resolved = resolve_prompt_path(run_dir)
+
+    assert resolved == launch_prompt
+
+
+def test_resolve_prompt_path_uses_task_specific_prompt(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    task_prompt = run_dir / "implement_prompt.md"
+    task_prompt.write_text("# Implement Prompt\n", encoding="utf-8")
+
+    resolved = resolve_prompt_path(run_dir, task="implement")
+
+    assert resolved == task_prompt
+
+
+def test_resolve_prompt_path_rejects_invalid_prompt_file_type(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "launch_prompt.md").write_text("# Launch Prompt\n", encoding="utf-8")
+
+    with pytest.raises(TypeError, match="prompt_file must be pathlib.Path"):
+        resolve_prompt_path(run_dir, prompt_file=False)  # type: ignore[arg-type]
+
+
 def test_run_agent_can_use_task_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -208,6 +240,36 @@ def test_run_agent_can_use_task_prompt(
     assert result.exit_code == 0, result.output
     cmd = captured["cmd"]
     assert cmd[cmd.index("--prompt") + 1] == "# Implement Prompt\n\nUse batching."
+
+
+def test_run_agent_with_prompt_true_uses_prompt_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    worktree, run_dir, _state = _setup_agent(tmp_path)
+
+    monkeypatch.setattr(cli_module, "ensure_opencode_available", lambda: None)
+    captured: dict[str, object] = {}
+
+    class _Completed:
+        returncode = 0
+        stdout = ""
+
+    def _mock_subprocess_run(cmd, cwd=None, check=False, **kwargs):
+        captured["cmd"] = cmd
+        captured["cwd"] = cwd
+        return _Completed()
+
+    monkeypatch.setattr(cli_module.subprocess, "run", _mock_subprocess_run)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run-agent", "oc1", "--project", "jungle", "--with-prompt"])
+
+    assert result.exit_code == 0, result.output
+    cmd = captured["cmd"]
+    assert "--prompt" in cmd
+    assert cmd[cmd.index("--prompt") + 1] == (run_dir / "launch_prompt.md").read_text(encoding="utf-8")
+    assert captured["cwd"] == worktree
 
 
 def test_run_agent_prompt_file_override_works_without_printing_secret(
@@ -491,7 +553,100 @@ models:
         "make mandate-start MANDATE_SLUG=test-issue MANDATE_TITLE='Test Issue' MANDATE_ACTIVE_BRANCH=staging",
     ]
     assert commands[1][1] == worktrees / "oc1-test-issue"
-    assert (worktrees / "oc1-test-issue" / ".github" / "mandates" / "test-issue.json").exists()
+    metadata_path = worktrees / "oc1-test-issue" / ".github" / "mandates" / "test-issue.json"
+    assert metadata_path.exists()
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "in_progress"
+    assert payload["repo"] == "jungle"
+    assert payload["agent_branch"] == "agent/oc1/test-issue"
+    assert payload["active_branch"] == "staging"
+    assert payload["worktree_path"] == str((worktrees / "oc1-test-issue").resolve())
+
+
+def test_preflight_after_claim_does_not_fail_not_in_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    project_file = tmp_path / "project.yaml"
+    project_file.write_text(
+        f"""
+name: jungle
+github:
+    owner: pinestraw
+    repo: jungle
+paths:
+    repo_root: {tmp_path / "repo"}
+    worktree_root: {tmp_path / "worktrees"}
+branches:
+    active_branch: staging
+commands:
+    create_worktree: custom-create --agent={{agent}} --slug={{slug}}
+    init_mandate: make mandate-start MANDATE_SLUG={{slug}} MANDATE_TITLE='{{title}}' MANDATE_ACTIVE_BRANCH={{active_branch_shell}}
+    preflight: make mandate-preflight MANDATE_SLUG={{slug}}
+models:
+    default:
+        provider: openrouter
+        model: z-ai/glm-4.7-flash
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "repo").mkdir(parents=True, exist_ok=True)
+    worktrees = tmp_path / "worktrees"
+    worktrees.mkdir(parents=True, exist_ok=True)
+
+    def _mock_run_command(cmd: str, cwd: Path | None = None):  # type: ignore[return]
+        if "custom-create" in cmd:
+            worktree = worktrees / "oc1-test-issue"
+            (worktree / ".github" / "mandates").mkdir(parents=True, exist_ok=True)
+        if "make mandate-start" in cmd:
+            metadata = worktrees / "oc1-test-issue" / ".github" / "mandates" / "test-issue.json"
+            metadata.write_text(
+                json.dumps(
+                    {
+                        "slug": "test-issue",
+                        "status": "done",
+                        "repo": "wrong-worktree-name",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        class _FakeResult:
+            stdout = ""
+
+        return _FakeResult()
+
+    monkeypatch.setattr(cli_module, "run_command", _mock_run_command)
+    monkeypatch.setattr(
+        cli_module,
+        "fetch_issue",
+        lambda owner, repo, issue: {"title": "Test Issue", "body": "Body", "number": issue},
+    )
+
+    def _mock_preflight_runner(*, command: str, worktree: Path, log_path: Path, verbose: bool, watch: bool):
+        metadata = worktree / ".github" / "mandates" / "test-issue.json"
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+        if payload.get("status") != "in_progress":
+            return cli_module.PreflightRunResult(
+                returncode=1,
+                output="[mandate] ERROR: Mandate test-issue is not in progress",
+            )
+        return cli_module.PreflightRunResult(returncode=0, output="ok")
+
+    monkeypatch.setattr(cli_module, "_run_preflight_command", _mock_preflight_runner)
+
+    runner = CliRunner()
+    claim_result = runner.invoke(
+        app,
+        ["claim", "--project-file", str(project_file), "--issue", "45", "--agent", "oc1", "--model", "openrouter/z-ai/glm-4.7-flash"],
+    )
+    assert claim_result.exit_code == 0, claim_result.output
+
+    preflight_result = runner.invoke(app, ["preflight", "oc1", "--project", "jungle"])
+    assert preflight_result.exit_code == 0, preflight_result.output
+    assert "not in progress" not in preflight_result.output.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +901,59 @@ def test_start_launch_calls_run_agent(
 
     assert result.exit_code == 0, result.output
     assert called == {"agent": "oc1", "project": "jungle", "print_prompt": False, "task": "implement"}
+
+
+def test_start_auto_launch_failure_still_prints_manual_next_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    project_file = _write_project_with_profiles(tmp_path)
+    (tmp_path / "repo").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "worktrees").mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        cli_module,
+        "fetch_issue",
+        lambda owner, repo, issue: {"title": "Start Command Issue", "body": "Body", "number": issue},
+    )
+
+    def _mock_run_command(cmd: str, cwd: Path | None = None):  # type: ignore[return]
+        if "echo create" in cmd:
+            (tmp_path / "worktrees" / "oc1-start-command-issue").mkdir(parents=True, exist_ok=True)
+
+        class _FakeResult:
+            stdout = ""
+
+        return _FakeResult()
+
+    monkeypatch.setattr(cli_module, "run_command", _mock_run_command)
+    monkeypatch.setattr(
+        cli_module,
+        "run_agent",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TypeError("Resolved prompt path has invalid exists attribute")),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "start",
+            "45",
+            "--agent",
+            "oc1",
+            "--project-file",
+            str(project_file),
+            "--profile",
+            "executor",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Auto-launch failed after setup" in result.output
+    assert "Worktree:" in result.output
+    assert "Prompt file:" in result.output
+    assert "Manual launch: cascade run-agent oc1 --project jungle" in result.output
+    assert "Loop alternative: cascade loop oc1 --project jungle --watch" in result.output
 
 
 def test_continue_uses_continue_prompt_when_launching(

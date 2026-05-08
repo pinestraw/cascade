@@ -11,6 +11,8 @@ from cascade.gates import (
     _extract_failed_hooks,
     build_failure_summary,
     check_gate_staleness,
+    classify_gate_failure,
+    failure_signature,
     gate_status_line,
     get_diff_fingerprint,
     get_git_head_sha,
@@ -221,3 +223,145 @@ def test_gate_status_line_passed_but_stale(
     }
     line = gate_status_line(result, tmp_path)
     assert "STALE" in line
+
+
+def test_failure_signature_prefers_hook_category_and_line() -> None:
+    gate_result: dict[str, object] = {
+        "touched_files": ["a.py", "b.py"],
+    }
+    log_tail = "Failed: mypy\nerror: name 'foo' is not defined\n"
+    signature = failure_signature(gate_result, log_tail)
+    assert "typing" in signature
+    assert "mypy" in signature
+    assert "a.py" in signature
+    assert "error:" in signature
+
+
+def test_failure_signature_falls_back_to_hash_when_log_has_no_meaningful_lines() -> None:
+    signature = failure_signature(None, "\n\n")
+    assert signature
+    assert "unknown" in signature
+
+
+def test_classify_dirty_closeout_failure() -> None:
+    log_tail = "ERROR: Unexpected dirty file while closing mandate: api/serializers/inventory.py\n"
+    result = classify_gate_failure(log_tail)
+    assert result["detected"] is True
+    assert result["hook"] == "mandate-dirty-file"
+    assert result["category"] == "workflow"
+    assert result["model_recommended"] is False
+    assert result["dirty_file_path"] == "api/serializers/inventory.py"
+    assert "closeout-prep" in str(result["suggested_no_model_action"])
+
+
+def test_dirty_closeout_signature_includes_path_line() -> None:
+    log_tail = "ERROR: Unexpected dirty file while closing mandate: api/serializers/inventory.py\n"
+    signature = failure_signature(None, log_tail)
+    assert "mandate-dirty-file" in signature
+    assert "workflow" in signature
+    assert "api/serializers/inventory.py" in signature
+
+
+def test_mandate_metadata_dirty_not_classified_as_coverage() -> None:
+    log_tail = (
+        "M .github/mandates/audit.log\n"
+        "?? .github/mandates/enrich-audit-log-messages.json\n"
+        "coverage summary emitted earlier\n"
+    )
+    result = classify_gate_failure(log_tail)
+    assert result["hook"] == "mandate-metadata"
+    assert result["category"] == "workflow"
+    assert result["model_recommended"] is False
+
+
+def test_coverage_classification_requires_explicit_failure_text() -> None:
+    non_failure_log = "coverage report generated\ncoverage: 87%\n"
+    non_failure = classify_gate_failure(non_failure_log)
+    assert non_failure["category"] != "coverage"
+
+    failure_log = "FAILED: coverage threshold not met (required 90%)\n"
+    failure = classify_gate_failure(failure_log)
+    assert failure["category"] == "coverage"
+    assert failure["hook"] == "coverage-policy"
+
+
+def test_missing_workspace_link_classified_as_environment() -> None:
+    log_tail = (
+        "ERROR: env file /workspace/jungle-worktrees/jungle-secrets/instica/.env.local not found\n"
+    )
+    result = classify_gate_failure(log_tail)
+    assert result["detected"] is True
+    assert result["hook"] == "missing-workspace-link"
+    assert result["category"] == "environment"
+    assert result["strategy"] == "deterministic_repair"
+    assert result["repair_kind"] == "missing-workspace-link"
+    assert result["model_recommended"] is False
+
+
+def test_missing_workspace_link_precedence_over_coverage_gate_name() -> None:
+    log_tail = (
+        "Preflight: backend changed-line coverage\n"
+        "ERROR: env file /workspace/jungle-worktrees/jungle-secrets/instica/.env.local not found\n"
+    )
+    result = classify_gate_failure(log_tail)
+    assert result["hook"] == "missing-workspace-link"
+    assert result["category"] == "environment"
+    assert result["model_recommended"] is False
+
+
+def test_docker_buildkit_mount_error_classified_as_environment() -> None:
+    log_tail = "the --mount option requires BuildKit. Refer to https://docs.docker.com/build/buildkit/ to enable it.\n"
+    result = classify_gate_failure(log_tail)
+    assert result["detected"] is True
+    assert result["hook"] == "docker-buildkit"
+    assert result["category"] == "environment"
+    assert result["strategy"] == "deterministic_repair"
+    assert result["repair_kind"] == "docker-buildkit"
+    assert result["model_recommended"] is False
+    assert "DOCKER_BUILDKIT" in str(result["suggested_no_model_action"])
+
+
+def test_docker_buildkit_compose_error_classified_as_environment() -> None:
+    log_tail = "Docker Compose requires buildx plugin to be installed\n"
+    result = classify_gate_failure(log_tail)
+    assert result["detected"] is True
+    assert result["hook"] == "docker-buildkit"
+    assert result["category"] == "environment"
+    assert result["model_recommended"] is False
+
+
+def test_docker_buildkit_classified_before_coverage() -> None:
+    log_tail = (
+        "Preflight: backend changed-line coverage\n"
+        "Docker Compose requires buildx plugin to be installed\n"
+    )
+    result = classify_gate_failure(log_tail)
+    assert result["hook"] == "docker-buildkit"
+    assert result["category"] == "environment"
+    assert result["model_recommended"] is False
+
+
+def test_docker_runtime_network_error_classified_as_environment() -> None:
+    log_tail = (
+        "Error response from daemon: container deadbeef is not connected to the network "
+        "jungle-sample_default\n"
+    )
+    result = classify_gate_failure(log_tail)
+    assert result["detected"] is True
+    assert result["hook"] == "docker-runtime-network"
+    assert result["category"] == "environment"
+    assert result["strategy"] == "deterministic_retry"
+    assert result["repair_kind"] == "docker-runtime-network"
+    assert result["model_recommended"] is False
+
+
+def test_docker_runtime_network_precedence_over_coverage_text() -> None:
+    log_tail = (
+        "Preflight: backend changed-line coverage\n"
+        "Error response from daemon: error while removing network: network "
+        "jungle-sample_default has active endpoints\n"
+    )
+    result = classify_gate_failure(log_tail)
+    assert result["hook"] == "docker-runtime-network"
+    assert result["category"] == "environment"
+    assert result["model_recommended"] is False

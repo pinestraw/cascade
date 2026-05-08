@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -31,8 +32,47 @@ class CommandsConfig(BaseModel):
     start_mandate: str | None = None
     init_mandate: str | None = None
     preflight: str | None = None
+    closeout_dirty_file: str | None = None
     done: str | None = None
+    propagate: str | None = None
     status: str | None = None
+
+
+class WorkspaceLinkConfig(BaseModel):
+    link: str
+    target: str
+
+
+class GateFixConfig(BaseModel):
+    command: str
+    model_required: bool = False
+
+
+class RepairRoutingRule(BaseModel):
+    strategy: str
+    profile: str | None = None
+
+
+class RepairLoopConfig(BaseModel):
+    max_iterations: int = 3
+    max_model_fixes: int = 2
+    max_estimated_cost_usd: float = 2.5
+    stop_on_same_failure_twice: bool = True
+    require_approval_categories: list[str] = Field(
+        default_factory=lambda: ["security", "policy", "migration"]
+    )
+    default_expected_output_tokens: dict[str, int] = Field(
+        default_factory=lambda: {"diagnose": 8000, "fix": 12000}
+    )
+    forbidden_touched_file_patterns: list[str] = Field(
+        default_factory=lambda: [
+            ".pre-commit-config.yaml",
+            "pyproject.toml",
+            "Makefile",
+            "scripts/pre_commit*",
+            ".github/workflows/*",
+        ]
+    )
 
 
 class BranchesConfig(BaseModel):
@@ -137,6 +177,24 @@ class RetryPolicyConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Dirty file repairs
+# ---------------------------------------------------------------------------
+
+
+class DirtyFileRepairsConfig(BaseModel):
+    """Configuration for safe deterministic dirty file repairs."""
+
+    auto_revert_tracked: list[str] = Field(
+        default_factory=list,
+        description="Tracked files that are safe to revert (git checkout --). Supports glob patterns.",
+    )
+    never_revert: list[str] = Field(
+        default_factory=list,
+        description="Files that should never be reverted. Supports glob patterns. Takes precedence over auto_revert_tracked.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Project config
 # ---------------------------------------------------------------------------
 
@@ -147,12 +205,18 @@ class ProjectConfig(BaseModel):
     github: GithubConfig
     paths: PathsConfig
     related_repos: dict[str, Path] = Field(default_factory=dict)
+    workspace_links: list[WorkspaceLinkConfig] = Field(default_factory=list)
     instructions: InstructionsConfig = Field(default_factory=InstructionsConfig)
     commands: CommandsConfig
+    autofix_commands: dict[str, str] = Field(default_factory=dict)
+    gate_fixes: dict[str, GateFixConfig] = Field(default_factory=dict)
+    repair_routing: dict[str, RepairRoutingRule] = Field(default_factory=dict)
+    repair_loop: RepairLoopConfig = Field(default_factory=RepairLoopConfig)
     branches: BranchesConfig = Field(default_factory=BranchesConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     context_budgets: ContextBudgetsConfig = Field(default_factory=ContextBudgetsConfig)
     retry_policy: RetryPolicyConfig = Field(default_factory=RetryPolicyConfig)
+    dirty_file_repairs: DirtyFileRepairsConfig = Field(default_factory=DirtyFileRepairsConfig)
 
     @model_validator(mode="after")
     def validate_required_fields(self) -> "ProjectConfig":
@@ -163,6 +227,64 @@ class ProjectConfig(BaseModel):
 
 class ConfigError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class ResolvedWorkspaceLink:
+    link_template: str
+    target_template: str
+    link_path: Path
+    target_path: Path
+
+
+def _render_workspace_link_path(
+    template: str,
+    project: "ProjectConfig",
+    *,
+    follow_symlinks: bool,
+) -> Path:
+    workspace_root = resolve_workspace_root(project)
+    values: dict[str, str] = {
+        "workspace_root": str(workspace_root) if workspace_root is not None else "",
+        "repo_root": str(project.paths.repo_root),
+        "worktree_root": str(project.paths.worktree_root),
+        "secrets_root": str(project.paths.secrets_root) if project.paths.secrets_root is not None else "",
+    }
+    try:
+        rendered = template.format(**values)
+    except KeyError as exc:
+        raise ConfigError(f"Invalid workspace_links template '{template}': missing placeholder {exc}.") from exc
+
+    raw_path = Path(rendered)
+    if not raw_path.is_absolute():
+        if workspace_root is None:
+            raw_path = (Path.cwd() / raw_path).absolute()
+        else:
+            raw_path = (workspace_root / raw_path).absolute()
+    else:
+        raw_path = raw_path.absolute()
+    if follow_symlinks:
+        raw_path = raw_path.resolve()
+    return raw_path
+
+
+def resolve_workspace_link_paths(project: "ProjectConfig") -> list[ResolvedWorkspaceLink]:
+    if project.workspace_links and project.paths.workspace_root is None:
+        raise ConfigError("workspace_links requires paths.workspace_root to be configured.")
+
+    resolved: list[ResolvedWorkspaceLink] = []
+    for entry in project.workspace_links:
+        link_path = _render_workspace_link_path(entry.link, project, follow_symlinks=False)
+        target_path = _render_workspace_link_path(entry.target, project, follow_symlinks=True)
+        resolved.append(
+            ResolvedWorkspaceLink(
+                link_template=entry.link,
+                target_template=entry.target,
+                link_path=link_path,
+                target_path=target_path,
+            )
+        )
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -199,10 +321,21 @@ def resolve_workspace_root(project: "ProjectConfig") -> Path | None:
     return project.paths.workspace_root.resolve()
 
 
-def is_inside_workspace(path: Path, workspace_root: Path) -> bool:
-    """Return True if *path* is inside (or equal to) *workspace_root*."""
+def is_inside_workspace(path: Path, workspace_root: Path, *, follow_symlinks: bool = True) -> bool:
+    """Return True if *path* is inside (or equal to) *workspace_root*.
+
+    By default, symlinks are followed (real-path containment).
+    Set ``follow_symlinks=False`` to validate the lexical path itself.
+    """
     try:
-        path.resolve().relative_to(workspace_root.resolve())
+        if follow_symlinks:
+            normalized_path = path.resolve(strict=False)
+            normalized_root = workspace_root.resolve(strict=False)
+        else:
+            normalized_path = Path(os.path.abspath(path))
+            normalized_root = Path(os.path.abspath(workspace_root))
+
+        normalized_path.relative_to(normalized_root)
         return True
     except ValueError:
         return False
@@ -390,3 +523,63 @@ def model_id_for_opencode(profile: ModelProfile) -> str:
     if provider == "openrouter":
         return f"openrouter/{profile.model}"
     return f"{provider}/{profile.model}"
+
+
+# ---------------------------------------------------------------------------
+# Default gate-fix models
+# ---------------------------------------------------------------------------
+
+_DEFAULT_GATE_FIX_MODELS = {
+    # Default: cheap, strong coding model
+    "default": ModelProfile(
+        provider="openrouter",
+        model="deepseek/deepseek-v3.2",
+        input_cost_per_million=0.36,
+        output_cost_per_million=1.44,
+        use_for=["fix"],
+    ),
+    # Fallback 1: absolute cheapest, still reasonable quality
+    "free_fallback": ModelProfile(
+        provider="openrouter",
+        model="qwen/qwen3-coder-480b-a35b-instruct:free",
+        input_cost_per_million=0.0,
+        output_cost_per_million=0.0,
+        use_for=["fix"],
+    ),
+    # Fallback 2: stronger for complex coding issues
+    "strong": ModelProfile(
+        provider="openrouter",
+        model="moonshotai/kimi-k2.6",
+        input_cost_per_million=5.0,
+        output_cost_per_million=15.0,
+        use_for=["fix"],
+    ),
+}
+
+
+def get_default_gate_fix_model() -> ModelProfile:
+    """Get the default cheap but strong gate-fix model."""
+    return _DEFAULT_GATE_FIX_MODELS["default"]
+
+
+def get_gate_fix_fallback_models() -> list[ModelProfile]:
+    """Get fallback models for gate-fix when primary fails."""
+    return [
+        _DEFAULT_GATE_FIX_MODELS["free_fallback"],
+        _DEFAULT_GATE_FIX_MODELS["strong"],
+    ]
+
+
+def resolve_gate_fix_model_profile(project: ProjectConfig, profile_name: str | None) -> ModelProfile:
+    """Resolve a gate-fix profile, preserving project overrides for built-in names.
+
+    The built-in cheap-fixer profile maps to the default DeepSeek gate-fix model unless
+    the project config explicitly defines a profile with that same name.
+    """
+    resolved_name = (profile_name or "cheap-fixer").strip() or "cheap-fixer"
+    if resolved_name == "cheap-fixer":
+        configured = project.models.profiles.get(resolved_name)
+        if configured is not None:
+            return configured
+        return get_default_gate_fix_model()
+    return get_model_profile(project, resolved_name)

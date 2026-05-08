@@ -28,6 +28,10 @@ paths:
   worktree_root: "jungle-worktrees"
   secrets_root: "jungle-secrets"
 
+workspace_links:
+  - link: "{worktree_root}/jungle-secrets"
+    target: "{secrets_root}"
+
 # Explicitly declared related repos that Cascade may operate on.
 # Do not add repos here unless they are truly part of this project family.
 # Cascade will not scan or auto-discover other sibling repos.
@@ -41,11 +45,83 @@ instructions:
     - "AGENT_MANDATE_PROTOCOL.md"
 
 commands:
+  # Mandate lifecycle:
+  # 1) claim/start creates worktree + mandate metadata
+  # 2) implement and commit on agent branch
+  # 3) preflight/loop until gate passes
+  # 4) finish marks closeout_ready
+  # 5) closeout executes mandate-done (squash merge + push)
+  # 6) propagate refreshes other worktrees best-effort
   create_worktree: "make agent-worktree-create agent={agent} slug={slug}"
-  mandate_start: "make mandate-start MANDATE_SLUG={slug} MANDATE_TITLE={title_shell} MANDATE_CANONICAL_MANDATE={canonical_mandate_shell} MANDATE_ACTIVE_BRANCH={active_branch_shell}"
+  mandate_start: "make mandate-start MANDATE_SLUG={slug} MANDATE_TITLE={title_shell} MANDATE_CANONICAL_MANDATE={canonical_mandate_shell} MANDATE_ACTIVE_BRANCH={active_branch_shell} MANDATE_ACTOR={agent}"
   preflight: "make mandate-preflight MANDATE_SLUG={slug}"
   done: "make mandate-done MANDATE_SLUG={slug}"
+  propagate: "make mandate-propagate MANDATE_SLUG={slug}"
   status: "git status --short"
+
+gate_fixes:
+  trailing-whitespace:
+    command: "pre-commit run trailing-whitespace --all-files"
+    model_required: false
+  end-of-file-fixer:
+    command: "pre-commit run end-of-file-fixer --all-files"
+    model_required: false
+  ruff-format:
+    command: "pre-commit run ruff-format --all-files"
+    model_required: false
+
+repair_routing:
+  formatting:
+    strategy: deterministic_first
+    profile: cheap_coder
+  typing:
+    strategy: model
+    profile: debugger
+  coverage:
+    strategy: diagnose_then_fix
+    profile: debugger
+  migration:
+    strategy: stop_or_model_with_warning
+    profile: debugger
+  security:
+    strategy: stop_requires_approval
+  policy:
+    strategy: stop_requires_approval
+  unknown:
+    strategy: diagnose_only
+    profile: debugger
+
+repair_loop:
+  max_iterations: 3
+  max_model_fixes: 2
+  max_estimated_cost_usd: 2.5
+  stop_on_same_failure_twice: true
+  require_approval_categories:
+    - security
+    - policy
+    - migration
+
+# ---------------------------------------------------------------------------
+# Deterministic dirty file repairs
+# ---------------------------------------------------------------------------
+# Cascade can automatically revert tracked files that match auto_revert_tracked
+# and don't match never_revert patterns. This enables deterministic recovery
+# from unrelated file modifications that occur during preflight.
+#
+# Example: if scripts/ensure_docker_desktop.sh gets modified by a preflight
+# step, and it's configured as auto_revert_tracked, Cascade will automatically
+# revert it instead of requiring manual intervention.
+# ---------------------------------------------------------------------------
+dirty_file_repairs:
+  auto_revert_tracked:
+    - "scripts/ensure_docker_desktop.sh"
+  never_revert:
+    - ".github/mandates/**"
+    - ".pre-commit-config.yaml"
+    - "pyproject.toml"
+    - "Makefile"
+    - "scripts/pre_commit*"
+    - ".github/workflows/**"
 
 branches:
   active_branch: staging

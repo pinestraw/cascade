@@ -18,10 +18,22 @@ NO_MODEL_COMMANDS: dict[str, CommandMeta] = {
         "mutates_target_repo": False,
     },
     "check": {
-        "description": "Show diff, run preflight, and optionally perform safe workflow repairs.",
+        "description": "Show diff, run preflight, and optionally invoke bounded auto-fix loop.",
         "requires_opencode": False,
         "requires_gh": False,
         "mutates_target_repo": True,
+    },
+    "loop": {
+        "description": "Run bounded auto-repair loop with deterministic-first routing and cost limits.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": True,
+    },
+    "loop-status": {
+        "description": "Show latest auto-repair loop metadata and suggested next action.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": False,
     },
     "repair": {
         "description": "Run known safe deterministic workflow repairs (no model calls).",
@@ -95,6 +107,12 @@ NO_MODEL_COMMANDS: dict[str, CommandMeta] = {
         "requires_gh": False,
         "mutates_target_repo": False,
     },
+    "gate-fix": {
+        "description": "Headless OpenRouter-based auto-fix loop for code-fixable gate failures.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": True,
+    },
     "context-pack": {
         "description": "Build a bounded deterministic context pack for a model-backed task.",
         "requires_opencode": False,
@@ -124,6 +142,18 @@ NO_MODEL_COMMANDS: dict[str, CommandMeta] = {
         "requires_opencode": False,
         "requires_gh": False,
         "mutates_target_repo": False,
+    },
+    "closeout": {
+        "description": "Execute mandate closeout command and mark lifecycle closed on success.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": True,
+    },
+    "complete": {
+        "description": "Run mandate completion end-to-end: preflight repair, commit, post-commit preflight, finish, and closeout.",
+        "requires_opencode": False,
+        "requires_gh": False,
+        "mutates_target_repo": True,
     },
     "next": {
         "description": "Recommend the next high-level command for the current agent state.",

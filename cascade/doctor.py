@@ -14,10 +14,13 @@ from cascade.config import (
     ValidationResult,
     is_inside_workspace,
     load_project_config,
+    resolve_workspace_link_paths,
     resolve_workspace_root,
     validate_project_paths,
     workspace_root_is_broad,
 )
+from cascade.migration import detect_docker_era_state
+from cascade.state import list_agent_states
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,15 @@ def _running_in_docker() -> bool:
 
 def _docker_socket_path() -> Path:
     return Path("/var/run/docker.sock")
+
+
+def _looks_like_docker_desktop(docker_info_output: str) -> bool:
+    return "docker desktop" in docker_info_output.lower()
+
+
+def _is_container_style_path(path: Path) -> bool:
+    value = str(path)
+    return value == "/workspace" or value.startswith("/workspace/")
 
 
 def _repo_uses_ssh_remote(repo_root: Path) -> bool:
@@ -97,6 +109,10 @@ def _makefile_has_target(makefile_path: Path, target: str) -> bool:
 
 def run_doctor_checks(project_file: Path) -> list[DoctorCheck]:
     checks: list[DoctorCheck] = []
+    running_in_docker = _running_in_docker()
+    docker_path = None
+    docker_socket_ok = False
+    docker_info_output = ""
 
     python_ok = sys.version_info >= (3, 11)
     checks.append(
@@ -152,7 +168,7 @@ def run_doctor_checks(project_file: Path) -> list[DoctorCheck]:
         )
     )
 
-    if _running_in_docker():
+    if running_in_docker:
         docker_path = shutil.which("docker")
         checks.append(
             DoctorCheck(
@@ -162,6 +178,83 @@ def run_doctor_checks(project_file: Path) -> list[DoctorCheck]:
                     docker_path
                     if docker_path
                     else "Docker CLI missing inside Cascade container; rebuild the image with host Docker support."
+                ),
+            )
+        )
+
+        if docker_path:
+            compose_version_result = subprocess.run(
+                ["docker", "compose", "version"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            checks.append(
+                DoctorCheck(
+                    name="docker compose version",
+                    status="ok" if compose_version_result.returncode == 0 else "fail",
+                    details=(
+                        (compose_version_result.stdout or "").strip().splitlines()[0]
+                        if compose_version_result.returncode == 0
+                        else (
+                            "docker compose version failed — compose plugin may be missing. "
+                            "Rebuild the Cascade image."
+                        )
+                    ),
+                )
+            )
+
+            buildx_version_result = subprocess.run(
+                ["docker", "buildx", "version"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            checks.append(
+                DoctorCheck(
+                    name="docker buildx version",
+                    status="ok" if buildx_version_result.returncode == 0 else "fail",
+                    details=(
+                        (buildx_version_result.stdout or "").strip().splitlines()[0]
+                        if buildx_version_result.returncode == 0
+                        else (
+                            "docker buildx plugin missing — rebuild the Cascade image with "
+                            "docker-buildx-plugin installed."
+                        )
+                    ),
+                )
+            )
+
+        buildkit_ok = os.getenv("DOCKER_BUILDKIT") == "1"
+        checks.append(
+            DoctorCheck(
+                name="DOCKER_BUILDKIT",
+                status="ok" if buildkit_ok else "warn",
+                details=(
+                    "DOCKER_BUILDKIT=1"
+                    if buildkit_ok
+                    else (
+                        "DOCKER_BUILDKIT is not set to 1. "
+                        "Add DOCKER_BUILDKIT=1 to .env to enable BuildKit for --mount support."
+                    )
+                ),
+            )
+        )
+
+        compose_buildkit_ok = os.getenv("COMPOSE_DOCKER_CLI_BUILD") == "1"
+        checks.append(
+            DoctorCheck(
+                name="COMPOSE_DOCKER_CLI_BUILD",
+                status="ok" if compose_buildkit_ok else "warn",
+                details=(
+                    "COMPOSE_DOCKER_CLI_BUILD=1"
+                    if compose_buildkit_ok
+                    else (
+                        "COMPOSE_DOCKER_CLI_BUILD is not set to 1. "
+                        "Add COMPOSE_DOCKER_CLI_BUILD=1 to .env to route Compose builds through BuildKit."
+                    )
                 ),
             )
         )
@@ -294,6 +387,24 @@ def run_doctor_checks(project_file: Path) -> list[DoctorCheck]:
 
     checks.append(DoctorCheck(name="project config", status="ok", details=f"Loaded project '{project.name}'"))
 
+    if running_in_docker and docker_path and docker_socket_ok and _looks_like_docker_desktop(docker_info_output):
+        path_candidates = [project.paths.repo_root, project.paths.worktree_root]
+        if project.paths.workspace_root is not None:
+            path_candidates.append(project.paths.workspace_root)
+        if project.paths.secrets_root is not None:
+            path_candidates.append(project.paths.secrets_root)
+
+        if any(_is_container_style_path(path) for path in path_candidates):
+            checks.append(
+                DoctorCheck(
+                    name="docker host-path parity",
+                    status="warn",
+                    details=(
+                        "Host Docker bind mounts may fail; prefer host-native Cascade or configure host-path parity."
+                    ),
+                )
+            )
+
     mandate_command_template = (
         project.commands.mandate_start
         or project.commands.start_mandate
@@ -379,6 +490,135 @@ def run_doctor_checks(project_file: Path) -> list[DoctorCheck]:
         if result.key in skip_keys:
             continue
         checks.append(DoctorCheck(name=result.key, status=result.status, details=result.message))
+
+    if project.workspace_links:
+        workspace_root = resolve_workspace_root(project)
+        if workspace_root is None:
+            checks.append(
+                DoctorCheck(
+                    name="workspace_links",
+                    status="fail",
+                    details="workspace_links is configured but paths.workspace_root is missing.",
+                )
+            )
+        else:
+            try:
+                resolved_links = resolve_workspace_link_paths(project)
+            except ConfigError as exc:
+                checks.append(DoctorCheck(name="workspace_links", status="fail", details=str(exc)))
+                resolved_links = []
+
+            for index, entry in enumerate(resolved_links, start=1):
+                link_name = f"workspace_link[{index}]"
+                if not is_inside_workspace(entry.link_path, workspace_root, follow_symlinks=False):
+                    checks.append(
+                        DoctorCheck(
+                            name=link_name,
+                            status="fail",
+                            details=(
+                                f"Link path escapes workspace_root: {entry.link_path} (workspace_root={workspace_root})."
+                            ),
+                        )
+                    )
+                    continue
+                if not is_inside_workspace(entry.target_path, workspace_root, follow_symlinks=True):
+                    checks.append(
+                        DoctorCheck(
+                            name=link_name,
+                            status="fail",
+                            details=(
+                                f"Target path escapes workspace_root: {entry.target_path} (workspace_root={workspace_root})."
+                            ),
+                        )
+                    )
+                    continue
+                if not entry.target_path.exists():
+                    checks.append(
+                        DoctorCheck(
+                            name=link_name,
+                            status="fail",
+                            details=f"Target path is missing: {entry.target_path}",
+                        )
+                    )
+                    continue
+                if not entry.link_path.exists() and not entry.link_path.is_symlink():
+                    checks.append(
+                        DoctorCheck(
+                            name=link_name,
+                            status="fail",
+                            details=(
+                                f"Link path is missing: {entry.link_path}. "
+                                "Run `cascade repair <agent> --project <project> --kind missing-workspace-link`."
+                            ),
+                        )
+                    )
+                    continue
+                if not entry.link_path.is_symlink():
+                    checks.append(
+                        DoctorCheck(
+                            name=link_name,
+                            status="fail",
+                            details=f"Link path exists and is not a symlink: {entry.link_path}",
+                        )
+                    )
+                    continue
+                try:
+                    linked_target = entry.link_path.resolve(strict=True)
+                except FileNotFoundError:
+                    checks.append(
+                        DoctorCheck(
+                            name=link_name,
+                            status="fail",
+                            details=f"Link path points to a missing target: {entry.link_path}",
+                        )
+                    )
+                    continue
+                if linked_target != entry.target_path.resolve():
+                    checks.append(
+                        DoctorCheck(
+                            name=link_name,
+                            status="fail",
+                            details=(
+                                f"Link points to unexpected target: {entry.link_path} -> {linked_target} "
+                                f"(expected {entry.target_path.resolve()})."
+                            ),
+                        )
+                    )
+                    continue
+                checks.append(
+                    DoctorCheck(
+                        name=link_name,
+                        status="ok",
+                        details=f"{entry.link_path} -> {entry.target_path.resolve()}",
+                    )
+                )
+
+    stale_agents: list[str] = []
+    for payload in list_agent_states(project.name):
+        agent_name = str(payload.get("agent", ""))
+        stale_keys = detect_docker_era_state(payload)
+        if stale_keys:
+            stale_agents.append(f"{agent_name} ({', '.join(stale_keys)})")
+    if stale_agents:
+        checks.append(
+            DoctorCheck(
+                name="docker-era-agent-state",
+                status="warn",
+                details=(
+                    "Stale Docker-era persisted state detected for: "
+                    + "; ".join(stale_agents)
+                    + ". Run `cascade repair <agent> --project <project> --kind docker-era-state`."
+                ),
+            )
+        )
+    else:
+        checks.append(
+            DoctorCheck(
+                name="docker-era-agent-state",
+                status="ok",
+                details="No stale Docker-era persisted state paths detected.",
+            )
+        )
 
     if _running_in_docker() and project.paths.repo_root.exists() and _repo_uses_ssh_remote(project.paths.repo_root):
         default_branch = _origin_default_branch(project.paths.repo_root)
